@@ -66,6 +66,7 @@ let wave = null; // this player's per-wave typing stats
 let best = 0;
 try { best = Number(localStorage.getItem(BEST_KEY)) || 0; } catch { /* storage unavailable */ }
 const myItems = () => G.players[NET.me].items;
+const PLAYER_COLORS = ['#ffd166', '#4fc3f7', '#b388ff', '#7ee06a'];
 
 // ---------- 3D scene: one keyboard per player side by side, the lane behind all of them
 
@@ -222,14 +223,72 @@ function buildLane() {
 
 // ---------- towers on keys
 
+// ---- Amplifier aura: a soft pink glow over the keys it boosts, pulsing, flaring when typed.
+const auras = new Set();
+let auraTexture = null;
+function getAuraTexture() {
+  if (auraTexture) return auraTexture;
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grad.addColorStop(0, 'rgba(255,255,255,0.55)');
+  grad.addColorStop(0.55, 'rgba(255,255,255,0.28)');
+  grad.addColorStop(0.82, 'rgba(255,255,255,0.45)'); // brighter rim marks the edge of the boost
+  grad.addColorStop(0.9, 'rgba(255,255,255,0.12)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 256, 256);
+  auraTexture = new THREE.CanvasTexture(c);
+  return auraTexture;
+}
+
+function removeAura(it) {
+  if (!it.aura) return;
+  it.aura.parent?.remove(it.aura);
+  it.aura.material.dispose();
+  it.aura.geometry.dispose();
+  auras.delete(it);
+  it.aura = null;
+}
+
+function addAura(pid, code, it) {
+  const k = KEY_BY_CODE[code], size = (AMP_RANGE + 0.55) * 2;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(size, size),
+    new THREE.MeshBasicMaterial({
+      map: getAuraTexture(), color: ITEMS.amp.color, transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, opacity: 0.6,
+    }),
+  );
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.set(k.x + k.w / 2, KEY_Y + 0.235, k.y + 0.5); // just above the key tops
+  mesh.renderOrder = 2;
+  boards[pid].root.add(mesh);
+  it.aura = mesh;
+  it.pulse = 0;
+  auras.add(it);
+}
+
+function animateAuras(now) {
+  for (const it of auras) {
+    const flare = Math.max(0, 1 - (now - it.pulse) / 350);
+    const base = 0.38 + 0.08 * it.level;
+    it.aura.material.opacity = base + 0.12 * Math.sin(now / 420) + 0.5 * flare;
+    it.aura.scale.setScalar(1 + 0.03 * Math.sin(now / 420) + 0.06 * flare);
+  }
+}
+
 function mountItem(pid, code, it) {
   if (it.obj) {
     it.obj.parent?.remove(it.obj);
     disposeTree(it.obj);
   }
+  removeAura(it);
   it.obj = buildItem(it.type, it.level);
   it.obj.position.set(0, 0.21, -0.12);
   boards[pid].keys.get(code).g.add(it.obj);
+  if (it.type === 'amp') addAura(pid, code, it);
   paintKey(pid, code);
 }
 
@@ -242,12 +301,14 @@ function setItem(pid, code, type, level) {
     if (cur) {
       cur.obj?.parent?.remove(cur.obj);
       if (cur.obj) disposeTree(cur.obj);
+      removeAura(cur);
       items.delete(code);
     }
     paintKey(pid, code);
     return;
   }
-  const it = cur && cur.type === type ? cur : { type, level, obj: cur?.obj ?? null, shots: 0, damage: 0 };
+  if (cur && cur.type !== type) removeAura(cur);
+  const it = cur && cur.type === type ? cur : { type, level, obj: cur?.obj ?? null, shots: 0, damage: 0, pid };
   it.level = level;
   items.set(code, it);
   mountItem(pid, code, it);
@@ -401,7 +462,10 @@ function damage(e, dmg, it, quiet = false) {
   const dealt = Math.min(e.hp, dmg);
   e.hp -= dmg;
   if (!quiet) e.flashUntil = time + 0.08;
-  if (it) it.damage += dealt;
+  if (it) {
+    it.damage += dealt;
+    if (it.pid != null) dmgAcc[it.pid] = (dmgAcc[it.pid] || 0) + dealt;
+  }
   if (e.hp <= 0) {
     popFx(e.group.position.clone(), e.def.color, e.def.size);
     removeEnemy(e);
@@ -527,6 +591,7 @@ function fire(pid, code, ctx, auth) {
   }
   if (it.type === 'amp') {
     ringFx(keyTop(pid, code), def.color, 1.2);
+    it.pulse = performance.now();
     return;
   }
   const all = alive();
@@ -869,6 +934,7 @@ function typeChar(ch, physCode, t) {
   lastT = t;
   wave.chars++;
   wave.last = t;
+  typeTimes.push(performance.now());
 
   spans[pos].classList.remove('cur');
   spans[pos].classList.add('done');
@@ -1285,9 +1351,133 @@ function startGame(players) {
   kb.setSelected(null);
   $('#centerMsg').hidden = true;
   $('#lobby').hidden = true;
+  $('#statsPanel').dataset.built = '';
+  resetStats();
   newText();
   openDraft(OPENING_PICKS);
 }
+
+// ---------- game-long stats: DPS, gold and WPM for every player, one sample per second
+
+const STAT_KEYS = ['dps', 'gold', 'wpm'];
+let timeline = [];   // [{ wave: bool, p: [[dps, gold, wpm], ...] }]
+let dmgAcc = [];     // damage dealt this second, per player (host/solo)
+let dmgWindow = [];  // per player: damage in each of the last 5 seconds
+let typeTimes = [];  // timestamps of my correct keystrokes in the last 10 seconds
+let reported = [];   // host: latest { gold, wpm } reported by each guest
+let statTimer = 0;
+
+function resetStats() {
+  timeline = [];
+  dmgAcc = [];
+  dmgWindow = G.players.map(() => []);
+  typeTimes = [];
+  reported = [];
+  statTimer = 0;
+  renderStats();
+}
+
+function myWpm() {
+  const now = performance.now();
+  while (typeTimes.length && now - typeTimes[0] > 10000) typeTimes.shift();
+  return Math.round(typeTimes.length * 1.2); // chars in 10 s -> words per minute (5 chars per word)
+}
+
+// Runs from the simulation timer, so it keeps sampling between rounds and in background tabs.
+function statsTick(dt) {
+  if (G.phase === 'lobby') return;
+  statTimer += dt;
+  if (statTimer < 1) return;
+  statTimer -= 1;
+  if (NET.role === 'guest') {
+    toHost({ t: 'stat', gold: goldNow(), wpm: myWpm() });
+    return; // the host sends everyone's sample back
+  }
+  const sample = G.players.map((p, pid) => {
+    const w = (dmgWindow[pid] ??= []);
+    w.push(dmgAcc[pid] || 0);
+    if (w.length > 5) w.shift();
+    const dps = Math.round(w.reduce((a, b) => a + b, 0) / w.length);
+    if (pid === NET.me) return [dps, goldNow(), myWpm()];
+    const r = reported[pid] ?? { gold: 0, wpm: 0 };
+    return [dps, p.online ? r.gold : 0, p.online ? r.wpm : 0];
+  });
+  dmgAcc = [];
+  pushSample({ wave: G.phase === 'wave', p: sample });
+  toGuests({ t: 'stats', wave: G.phase === 'wave', p: sample });
+}
+
+function pushSample(sample) {
+  timeline.push(sample);
+  renderStats();
+}
+
+function drawChart(cv, k) {
+  const W = cv.clientWidth, H = cv.clientHeight, dpr = devicePixelRatio || 1;
+  if (!W || !H) return;
+  cv.width = W * dpr;
+  cv.height = H * dpr;
+  const g = cv.getContext('2d');
+  g.scale(dpr, dpr);
+  const n = timeline.length;
+  if (n < 2) return;
+  const max = Math.max(10, ...timeline.flatMap(s => s.p.map(v => v[k]))) * 1.1;
+  const X = i => (i / (n - 1)) * W, Y = v => H - 2 - (v / max) * (H - 4);
+  // shade the wave periods
+  g.fillStyle = 'rgba(255,107,91,0.10)';
+  let start = null;
+  timeline.forEach((s, i) => {
+    if (s.wave && start == null) start = i;
+    if ((!s.wave || i === n - 1) && start != null) {
+      g.fillRect(X(start), 0, X(i) - X(start), H);
+      start = null;
+    }
+  });
+  G.players.forEach((p, pid) => {
+    g.strokeStyle = PLAYER_COLORS[pid];
+    g.lineWidth = pid === NET.me ? 2 : 1.4;
+    g.globalAlpha = pid === NET.me ? 1 : 0.8;
+    g.beginPath();
+    timeline.forEach((s, i) => {
+      const v = s.p[pid]?.[k] ?? 0;
+      if (i) g.lineTo(X(i), Y(v));
+      else g.moveTo(X(i), Y(v));
+    });
+    g.stroke();
+  });
+  g.globalAlpha = 1;
+}
+
+function renderStats() {
+  const el = $('#statsPanel');
+  el.hidden = G.phase === 'lobby';
+  if (el.hidden) return;
+  const last = timeline.at(-1)?.p ?? [];
+  const mins = Math.floor(timeline.length / 60), secs = String(timeline.length % 60).padStart(2, '0');
+  const multi = G.players.length > 1;
+  if (!el.dataset.built) {
+    el.innerHTML = `<div class="sp-head"><span>Game stats</span><span class="sp-time"></span><button class="sp-toggle" title="Show or hide the charts">–</button></div>
+      <div class="sp-body">${STAT_KEYS.map((k, i) => `<div class="sp-row"><div class="sp-label">${['DPS', 'Gold', 'WPM'][i]}<span class="sp-vals" data-k="${i}"></span></div><canvas class="sp-chart" data-k="${i}"></canvas></div>`).join('')}
+      <div class="sp-legend"></div></div>`;
+    el.dataset.built = '1';
+  }
+  el.querySelector('.sp-time').textContent = `${mins}:${secs}`;
+  STAT_KEYS.forEach((_, i) => {
+    el.querySelector(`.sp-vals[data-k="${i}"]`).innerHTML = G.players.map((p, pid) =>
+      `<b style="color:${PLAYER_COLORS[pid]}">${last[pid]?.[i] ?? 0}</b>`).join(multi ? ' · ' : '');
+    if (!el.classList.contains('collapsed')) drawChart(el.querySelector(`.sp-chart[data-k="${i}"]`), i);
+  });
+  el.querySelector('.sp-legend').innerHTML = multi
+    ? G.players.map((p, pid) => `<span><i style="background:${PLAYER_COLORS[pid]}"></i>${esc(p.name)}${pid === NET.me ? ' (you)' : ''}</span>`).join('') + '<span><i class="wavebox"></i>wave</span>'
+    : '<span><i class="wavebox"></i>shaded = wave in progress</span>';
+}
+$('#statsPanel').addEventListener('click', e => {
+  if (!e.target.closest('.sp-toggle')) return;
+  const el = $('#statsPanel');
+  el.classList.toggle('collapsed');
+  e.target.textContent = el.classList.contains('collapsed') ? '+' : '–';
+  renderStats();
+});
 
 // ---------- lobby and networking
 
@@ -1302,7 +1492,7 @@ function readName() {
 }
 
 function lobbyPlayersHTML(list) {
-  return `<ul class="plist">${list.map((p, i) => `<li><span class="pdot" style="background:${['#ffd166', '#4fc3f7', '#b388ff', '#7ee06a'][i]}"></span>${esc(p.name)}${p.id === myPeerId() ? ' <span class="muted">(you)</span>' : ''}${i === 0 ? ' <span class="muted">· host</span>' : ''}</li>`).join('')}
+  return `<ul class="plist">${list.map((p, i) => `<li><span class="pdot" style="background:${PLAYER_COLORS[i]}"></span>${esc(p.name)}${p.id === myPeerId() ? ' <span class="muted">(you)</span>' : ''}${i === 0 ? ' <span class="muted">· host</span>' : ''}</li>`).join('')}
     ${Array.from({ length: MAX_PLAYERS - list.length }, () => '<li class="empty">open slot</li>').join('')}</ul>`;
 }
 
@@ -1411,6 +1601,7 @@ function leaveRoom() {
   fitView();
   renderViewBtn();
   $('#centerMsg').hidden = true;
+  renderStats();
   setTextState();
   renderShop();
   renderHud();
@@ -1474,6 +1665,9 @@ function hostMessage(msg, from) {
       setItem(pid, msg.code, msg.type, msg.level);
       toGuests({ t: 'item', pid, code: msg.code, type: msg.type, level: msg.level }, from);
       break;
+    case 'stat':
+      reported[pid] = { gold: msg.gold, wpm: msg.wpm };
+      break;
     case 'ready':
       Object.assign(G.players[pid], { ready: true, slow: msg.slow ?? [] });
       hostCheckReady();
@@ -1529,6 +1723,9 @@ function guestMessage(msg) {
     case 'snap':
       applySnapshot(msg);
       break;
+    case 'stats':
+      pushSample({ wave: msg.wave, p: msg.p });
+      break;
     case 'waveEnd':
       for (const e of [...enemies]) removeEnemy(e);
       enemies = [];
@@ -1581,7 +1778,7 @@ function renderShop() {
   let html = '';
   if (isMulti()) {
     html += `<div class="card"><h3><span>Room ${NET.room?.code ?? ''}</span><span class="hint">${G.players.length} players</span></h3>
-      <ul class="plist small">${G.players.map((p, pid) => `<li><span class="pdot" style="background:${['#ffd166', '#4fc3f7', '#b388ff', '#7ee06a'][pid]}"></span>${esc(p.name)}${pid === NET.me ? ' <span class="muted">(you)</span>' : ''}
+      <ul class="plist small">${G.players.map((p, pid) => `<li><span class="pdot" style="background:${PLAYER_COLORS[pid]}"></span>${esc(p.name)}${pid === NET.me ? ' <span class="muted">(you)</span>' : ''}
         <span class="pstate">${!p.online ? 'left' : G.phase === 'wave' ? `${p.items.size} towers` : p.ready ? '✓ ready' : 'choosing…'}</span></li>`).join('')}</ul></div>`;
   }
   html += `<div class="card"><h3><span>Your towers (${owned.length})</span><span class="hint">${status}</span></h3>`;
@@ -1591,7 +1788,7 @@ function renderShop() {
       <span class="dot" style="background:${hex(d.color)}"></span>
       <span class="nm"><span class="chip">${keyLabel(code)}</span> ${d.name} <span class="num">L${it.level}/${MAX_LEVEL}</span></span>
       ${up != null ? `<button class="upmini" data-up="${code}" ${open && G.gold >= up ? '' : 'disabled'}>▲ ${up}g</button>` : '<span class="num">max</span>'}
-      <span class="ds">${effectText(it, code)} · ${it.shots} ${it.type === 'mine' ? 'presses' : 'shots'}${isAuth() && it.type !== 'mine' ? ` · ${Math.round(it.damage)} dmg dealt` : ''}</span>
+      <span class="ds">${effectText(it, code)} · ${it.shots} ${it.type === 'mine' ? 'presses' : 'shots'}${isAuth() && it.type !== 'mine' && !d.support ? ` · ${Math.round(it.damage)} dmg dealt` : ''}</span>
     </div>`;
   }).join('')}</div>` : '<p class="hint">No towers yet. Pick a card from the draft.</p>';
   html += '</div>';
@@ -1757,6 +1954,7 @@ ticker.onmessage = () => {
 };
 
 function simStep(dt) {
+  if (!paused) statsTick(dt);
   if (G.phase === 'wave' && !paused) {
     time += dt;
     if (isAuth()) {
@@ -1785,6 +1983,7 @@ function loop(now) {
   lastFrame = now;
   updateFx(dt);
   animateClones(now);
+  animateAuras(now);
   if (G.phase === 'draft') art.render(now / 1000, i => i === hoverCard || i === G.draft?.tower);
 }
 
