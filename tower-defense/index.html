@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Key Defense</title>
+  <link rel="stylesheet" href="../css/style.css">
+  <link rel="stylesheet" href="game.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <!-- PeerJS: browser-to-browser connections for multiplayer rooms -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Key<span>Defense</span></div>
+    <div class="hud" id="hud"></div>
+    <div class="actions"><a class="navlink" href="../">← Typing trainer</a></div>
+  </header>
+
+  <main class="game">
+    <section class="play">
+      <div class="text-wrap" id="textWrap">
+        <div class="text" id="text"></div>
+        <div class="overlay" id="textOverlay"></div>
+      </div>
+      <div class="draft" id="draft" hidden></div>
+      <div class="kb-wrap">
+        <div class="kb game-kb" id="kb"></div>
+        <button class="viewbtn" id="viewBtn" hidden></button>
+        <div class="center-msg" id="lobby" hidden></div>
+        <div class="center-msg" id="centerMsg" hidden></div>
+        <div class="tooltip" id="tooltip"></div>
+      </div>
+      <div class="toast" id="toast"></div>
+    </section>
+
+    <aside class="shop" id="shop"></aside>
+  </main>
+
+  <script type="module" src="game.js"></script>
+</body>
+</html>

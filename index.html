@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KeyGraph</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Key<span>Graph</span></div>
+    <nav class="seg" id="modeSeg">
+      <button data-mode="learn">Learn</button>
+      <button data-mode="free">Free type</button>
+    </nav>
+    <div class="actions">
+      <label class="target">Target <input id="target" type="number" min="10" max="250" step="5"> wpm</label>
+      <button id="exportBtn">Export</button>
+      <button id="importBtn">Import</button>
+      <input id="importFile" type="file" accept="application/json" hidden>
+      <button id="resetBtn" class="danger">Reset</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="practice">
+      <div class="metrics">
+        <div class="mrow"><span class="lbl">Metrics:</span><span class="val" id="mSummary"></span></div>
+        <div class="mrow" id="rowKeys"><span class="lbl">All keys:</span><span class="val keystrip" id="mKeys"></span></div>
+        <div class="mrow" id="rowCurrent"><span class="lbl">Current key:</span><span class="val" id="mCurrent"></span></div>
+        <div class="mrow"><span class="lbl">Daily goal:</span>
+          <span class="val daily">
+            <span id="dailyText"></span>
+            <span class="dbar"><span class="dfill" id="dailyFill"></span></span>
+            <span id="dailyStreak"></span>
+            <label class="goal">goal <input id="goalInput" type="number" min="5" max="240" step="5"> min</label>
+            <button class="linkbtn" id="calToggle">calendar ▾</button>
+          </span>
+        </div>
+        <div class="calendar" id="calendar" hidden></div>
+      </div>
+
+      <div class="text-wrap" id="textWrap">
+        <div class="text" id="text"></div>
+        <textarea id="freeText" spellcheck="false" placeholder="Type anything here. Every key you press (letters, numbers, Shift, Backspace, arrows…) is recorded as a transition from the key before it."></textarea>
+        <button class="overlay" id="overlay">Click or press Enter to start</button>
+      </div>
+      <div class="toast" id="toast"></div>
+
+      <div class="kb-wrap">
+        <div class="kb-toolbar">
+          <span class="tlbl">Graph</span>
+          <div class="seg small" id="graphSeg">
+            <button data-graph="finger" title="Arc = where the finger that presses the key was before (only connects keys of the same finger)">Finger travel</button>
+            <button data-graph="sequence" title="Arc = the key typed right before (any finger)">Key sequence</button>
+          </div>
+          <span class="tlbl">Arcs</span>
+          <div class="seg small" id="edgeSeg">
+            <button data-edge="in" title="Arcs arriving at the selected key">Into key</button>
+            <button data-edge="out" title="Arcs leaving the selected key">Out of key</button>
+            <button data-edge="both">Both</button>
+            <button data-edge="weak" title="The 20 slowest transitions on the whole keyboard">Weakest 20</button>
+            <button data-edge="strong" title="The 20 fastest transitions on the whole keyboard">Strongest 20</button>
+            <button data-edge="off">Off</button>
+          </div>
+          <span class="tlbl">Keys</span>
+          <div class="seg small" id="colorSeg">
+            <button data-color="speed">Speed</button>
+            <button data-color="finger">Fingers</button>
+          </div>
+          <button class="small ghost" id="resetView">Reset view</button>
+        </div>
+        <div class="kb" id="kb"></div>
+        <div class="legend">
+          <span>slow</span><span class="grad"></span><span id="legendRight">target speed</span>
+          <span class="hint">Drag to orbit · scroll to zoom · right-drag to pan · click a key to inspect it</span>
+        </div>
+        <div class="tooltip" id="tooltip"></div>
+      </div>
+    </section>
+
+    <aside class="inspector" id="inspector"></aside>
+  </main>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
