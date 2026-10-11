@@ -10,7 +10,7 @@ import {
   upgradeCost, scrapValue, waveSpec, waveBonus, keyCostMult, keyPowerMult,
   OPENING_PICKS, OPENING_KEY_POOL, SKIP_GOLD, rerollCost,
   NON_OPENING, AMP_RANGE, MODS, BOSS_EVERY, BANES, BANE_WORD_SHARE, BOARD_GAP, setLanePlayers,
-  isFocusWave, FOCUSES, FOCUS_WORD_BIAS, FOCUS_DAMAGE, BRIDGE_POWER,
+  isFocusWave, FOCUSES, FOCUS_WORD_BIAS, FOCUS_DAMAGE, BRIDGE_POWER, FINAL_WAVE, BANE_KINDS,
 } from './defs.js';
 import { GEO, hex, textSprite, buildItem, disposeTree, itemHSL, CardArt } from './models.js';
 import { Room, MAX_PLAYERS } from './net.js';
@@ -58,8 +58,10 @@ function newGame(players) {
     bane: null,       // active boss bane: { kind, letters: { [pid]: [l, l, l] } }
     focus: null,      // focus region for the current/upcoming wave (key of FOCUSES)
     lastFocus: null,
-    bridgePick: null, // boss reward in progress: { from }
+    bridgePick: null, // boss reward in progress: { from, to }
+    endless: false,   // kept playing after winning
     lastBane: null,
+    baneOffset: 0,    // rotation of BANE_KINDS for this game (set by the host)
     seenMods: {},
   };
 }
@@ -358,6 +360,11 @@ function spawnEnemy(spec) {
   const body = new THREE.Mesh(shape, mat);
   body.scale.setScalar(def.size);
   if (spec.type === 'runner') body.rotation.z = Math.PI / 2; // point along the direction of travel
+  const bossLook = spec.type === 'boss' ? BOSS_LOOKS[spec.bane?.kind] ?? BOSS_LOOKS.none : null;
+  if (bossLook) {
+    mat.color.setHex(bossLook.color);
+    if (spec.final) body.scale.setScalar(def.size * 1.3);
+  }
   const group = new THREE.Group();
   group.add(body);
   const bar = new THREE.Group();
@@ -377,6 +384,7 @@ function spawnEnemy(spec) {
     mod: spec.mod, shield: spec.mod === 'shield', lock: spec.lock ?? null, haste: 1,
     poisonDps: 0, poisonUntil: 0, poisonSrc: null,
     bane: spec.bane ? { ...spec.bane, openUntil: 0 } : null,
+    final: !!spec.final,
   };
   if (e.shield || e.bane?.kind === 'shield') {
     e.bubble = new THREE.Mesh(GEO.sphere, new THREE.MeshBasicMaterial({ color: 0x66b3ff, transparent: true, opacity: 0.3, depthWrite: false }));
@@ -385,17 +393,70 @@ function spawnEnemy(spec) {
   }
   // letter tag: a locked enemy's letter, or (on a bane boss) your own slow keys
   const myBane = e.bane?.letters[NET.me] ?? [];
-  const tag = e.lock ? e.lock.toUpperCase() : e.bane ? myBane.map(l => l.toUpperCase()).join(' ') : null;
+  const tag = e.lock ? e.lock.toUpperCase()
+    : e.bane ? `${spec.final ? 'FINAL ' : ''}${BANES[e.bane.kind].name.toUpperCase()} · ${myBane.map(l => l.toUpperCase()).join(' ')}` : null;
   if (tag) {
     e.tag = textSprite(tag, e.bane ? '#ff9b8a' : '#ffd166');
     e.tag.material.depthTest = false;
-    e.tag.scale.set(e.bane ? 3.6 : 2.8, e.bane ? 0.9 : 0.7, 1);
-    e.tag.position.y = def.size + 0.75;
+    e.tag.scale.set(e.bane ? 4.8 : 2.8, e.bane ? 1.2 : 0.7, 1);
+    e.tag.position.y = def.size * (spec.final ? 1.3 : 1) + (e.bane ? 1.1 : 0.75);
     group.add(e.tag);
   }
+  if (bossLook) addBossParts(e, spec, bossLook);
   enemies.push(e);
   enemyById.set(e.id, e);
   return e;
+}
+
+const BOSS_LOOKS = {
+  lock: { name: 'Lockjaw', color: 0xff7043 },
+  shield: { name: 'Aegis', color: 0x42a5f5 },
+  frenzy: { name: 'Frenzy', color: 0xe53935 },
+  none: { name: 'Boss', color: 0xab47bc },
+};
+
+// Spikes for Lockjaw, orbiting rings for Aegis, a crown for the final boss (Frenzy pulses).
+function addBossParts(e, spec, look) {
+  const size = e.body.scale.x;
+  const parts = new THREE.Group();
+  if (spec.bane?.kind === 'lock') {
+    const spikeMat = new THREE.MeshStandardMaterial({ color: 0xffccbc, roughness: 0.4 });
+    const dirs = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1], [0.7, 0.7, 0], [-0.7, 0.7, 0], [0, 0.7, 0.7], [0, 0.7, -0.7]];
+    for (const d of dirs) {
+      const v = new THREE.Vector3(...d).normalize();
+      const spike = new THREE.Mesh(GEO.cone, spikeMat);
+      spike.scale.setScalar(size * 0.22);
+      spike.position.copy(v).multiplyScalar(size * 1.05);
+      spike.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), v);
+      parts.add(spike);
+    }
+  } else if (spec.bane?.kind === 'shield') {
+    const ringMat = new THREE.MeshStandardMaterial({ color: 0xffd166, emissive: 0x6b4e00, roughness: 0.3, metalness: 0.6 });
+    for (let i = 0; i < 2; i++) {
+      const ring = new THREE.Mesh(GEO.ring, ringMat);
+      ring.scale.setScalar(size * 1.55);
+      ring.rotation.x = Math.PI / 2 + (i ? 0.9 : -0.9);
+      parts.add(ring);
+    }
+  }
+  if (spec.final) {
+    const gold = new THREE.MeshStandardMaterial({ color: 0xffd166, emissive: 0x6b4e00, roughness: 0.3, metalness: 0.7 });
+    const crown = new THREE.Group();
+    const band = new THREE.Mesh(GEO.cyl, gold);
+    band.scale.set(size * 0.55, size * 0.18, size * 0.55);
+    crown.add(band);
+    for (let i = 0; i < 5; i++) {
+      const tip = new THREE.Mesh(GEO.cone, gold);
+      const a = (i / 5) * Math.PI * 2;
+      tip.scale.setScalar(size * 0.12);
+      tip.position.set(Math.cos(a) * size * 0.45, size * 0.2, Math.sin(a) * size * 0.45);
+      crown.add(tip);
+    }
+    crown.position.y = size * 1.05;
+    e.group.add(crown);
+  }
+  e.group.add(parts);
+  e.bossParts = parts;
 }
 
 // Host/solo: create the next enemy of the wave and tell guests.
@@ -404,7 +465,9 @@ function hostSpawn(raw) {
     id: nextEnemyId++, type: raw.type, hp: raw.hp, mod: raw.mod,
     lock: raw.mod === 'lock' ? letterOf(COMMON_CODES[Math.floor(Math.random() * COMMON_CODES.length)]) : null,
     bane: raw.type === 'boss' && G.bane ? G.bane : null,
+    final: raw.type === 'boss' && G.wave === finalWave() && !G.endless,
   };
+  if (spec.final) spec.hp = Math.round(spec.hp * 1.3);
   spawnEnemy(spec);
   toGuests({ t: 'spawn', spec });
 }
@@ -478,6 +541,7 @@ function damage(e, dmg, it, quiet = false) {
     popFx(e.group.position.clone(), e.def.color, e.def.size);
     removeEnemy(e);
     G.totals.kills++;
+    if (e.type === 'boss') bossKilled = true;
     toGuests({ t: 'die', id: e.id });
   }
 }
@@ -514,6 +578,13 @@ function updateEnemies(dt) {
     const bob = Math.abs(Math.sin(time * 6 + e.phase)) * 0.08;
     e.group.position.set(LANE.startX - e.dist, 0.26 + e.def.size + bob, LANE.z + e.off);
     if (e.type === 'tank' || e.type === 'boss') e.body.rotation.y += dt;
+    if (e.bossParts) {
+      e.bossParts.rotation.y += dt * (e.bane?.kind === 'shield' ? 1.6 : 0.8);
+      if (e.bane?.kind === 'frenzy') { // pulses faster the more frenzied it gets
+        const base = e.def.size * (e.final ? 1.3 : 1);
+        e.body.scale.setScalar(base * (1 + 0.08 * Math.sin(time * 8 * e.haste)));
+      }
+    }
     if (time < e.flashUntil) e.mat.emissive.setRGB(0.9, 0.9, 0.9);
     else if (e.haste > 1) e.mat.emissive.setRGB(0.25 * (e.haste - 1) + 0.1 * Math.sin(time * 12), 0.05, 0);
     else if (e.poisonDps) e.mat.emissive.setRGB(0.05, 0.3, 0.05);
@@ -577,6 +648,13 @@ function ampBonus(pid, code) {
   return bonus;
 }
 const ampNeighbours = code => LETTER_CODES.filter(c => c !== code && travel(code, c).dist <= AMP_RANGE);
+// "boosts 3 of your towers (E R S) · also covers F C X"
+function ampHint(code) {
+  const near = ampNeighbours(code), mine = near.filter(c => myItems().has(c) && myItems().get(c).type !== 'amp');
+  const rest = near.filter(c => !mine.includes(c));
+  return `boosts ${mine.length} of your tower${mine.length === 1 ? '' : 's'}${mine.length ? ` (${mine.map(keyLabel).join(' ')})` : ''}` +
+    (rest.length ? ` · also covers ${rest.map(keyLabel).join(' ')}` : '');
+}
 
 // ---------- focus waves
 
@@ -704,10 +782,14 @@ function fireTower(pid, code, ctx, auth, via = null) {
       const t = leader(list);
       aim(it, from, t);
       boltFx(from, t, def.color, 0.08);
-      ringFx(t.group.position.clone(), def.color, 0.6);
+      ringFx(t.group.position.clone(), def.color, def.slowRadius);
       if (auth) {
-        t.slow = def.slow;
-        t.slowUntil = time + def.slowTime * (1 + 0.5 * (it.level - 1));
+        // chills the target and everything near it
+        for (const e of list) {
+          if (e !== t && e.group.position.distanceTo(t.group.position) > def.slowRadius) continue;
+          e.slow = def.slow;
+          e.slowUntil = time + def.slowTime * (1 + 0.5 * (it.level - 1));
+        }
       }
       hit(t, dmg);
       break;
@@ -765,19 +847,24 @@ function fireTower(pid, code, ctx, auth, via = null) {
       setTimeout(() => {
         if (G.phase !== 'wave') return;
         ringFx(p, def.color, def.splash);
-        for (const e of alive()) if (e.group.position.distanceTo(p) <= def.splash && vulnerable(e, pid, ctx.word)) hit(e, dmg);
+        for (const e of alive()) {
+          if (e.group.position.distanceTo(p) > def.splash || !vulnerable(e, pid, ctx.word)) continue;
+          hit(e, e === t ? dmg : dmg * def.otherShare); // the shell's target takes full damage
+        }
       }, 350);
       break;
     }
     case 'gust': {
-      const t = leader(list);
-      aim(it, from, t);
-      ringFx(t.group.position.clone(), def.color, 0.9);
-      if (auth) {
-        const push = def.push * (1 + 0.25 * (it.level - 1)) * (t.type === 'boss' ? 0.2 : t.type === 'tank' ? 0.5 : 1);
-        t.dist = Math.max(0, t.dist - push);
+      const targets = [...list].sort((a, b) => b.dist - a.dist).slice(0, def.targets);
+      aim(it, from, targets[0]);
+      for (const t of targets) {
+        ringFx(t.group.position.clone(), def.color, 0.9);
+        if (auth) {
+          const push = def.push * (1 + 0.25 * (it.level - 1)) * (t.type === 'boss' ? 0.2 : t.type === 'tank' ? 0.5 : 1);
+          t.dist = Math.max(0, t.dist - push);
+        }
+        hit(t, dmg);
       }
-      hit(t, dmg);
       break;
     }
     case 'herald':
@@ -1091,7 +1178,8 @@ function setTextState() {
   document.body.classList.toggle('drafting', G.phase === 'draft' || G.phase === 'bridge');
   wrap.classList.toggle('active', G.phase === 'wave' && !paused);
   ov.textContent = G.phase === 'lobby' ? 'Choose how to play'
-    : G.phase === 'bridge' ? 'Boss reward: type a key to link from, then one of your towers'
+    : G.phase === 'bridge' ? 'Boss reward: type a key to link from, then one of your towers, then Enter'
+    : G.phase === 'victory' ? `Victory! ${NET.role === 'guest' ? 'Waiting for the host…' : 'Press Enter to keep going (endless)'}`
     : G.phase === 'shop' ? `Spend gold on upgrades, then press Enter when you're ready for wave ${G.wave}`
     : G.phase === 'ready' ? `Ready! Waiting for ${waitingFor().join(', ') || 'the host'}…`
     : paused ? 'Paused. Press Esc to continue' : '';
@@ -1239,7 +1327,7 @@ function keyCardHTML(code, i) {
   const d = type && ITEMS[type];
   const effect = !d ? `damage ×${pm.toFixed(2)} per shot`
     : type === 'mine' ? `+${(d.gold * pm).toFixed(1)} gold per press`
-    : d.support ? `boosts ${ampNeighbours(code).map(c => keyLabel(c)).join(' ')}`
+    : d.support ? ampHint(code)
     : `${Math.round(d.dmg * pm)} damage per shot`;
   const feel = f.rank <= 8 ? 'fires often, small hits' : f.rank >= 19 ? 'fires rarely, big hits' : 'fires sometimes, medium hits';
   return `<button class="kcard ${d ? 'ready' : ''}" data-key="${i}" style="--c:${d ? hex(d.color) : '#8a8c92'}">
@@ -1299,7 +1387,10 @@ function slowestKeys(n = 3) {
     .map(([code, r]) => ({ code, ms: r.sum / r.n })).sort((a, b) => b.ms - a.ms).slice(0, n);
 }
 
-const isBossWave = n => n % BOSS_EVERY === 0;
+// (dev shortcuts ?bossEvery=1 / ?final=2 make bosses and the win easy to test in solo)
+let devBossEvery = 0, devFinal = 0;
+const isBossWave = n => n % (devBossEvery || BOSS_EVERY) === 0;
+const finalWave = () => devFinal || FINAL_WAVE;
 
 // Host: one bane per boss, with each player's own three slowest keys.
 function chooseBane() {
@@ -1310,16 +1401,31 @@ function chooseBane() {
     const fill = shuffle(COMMON_CODES.slice(6).map(letterOf)).filter(l => !slow.includes(l));
     letters[pid] = [...slow, ...fill].slice(0, 3);
   });
-  const kinds = Object.keys(BANES).filter(k => k !== G.lastBane);
-  const kind = kinds[Math.floor(Math.random() * kinds.length)];
-  G.lastBane = kind;
-  return { kind, letters };
+  return { kind: baneKindFor(G.wave), letters };
+}
+
+const bossIndex = wave => Math.floor(wave / (devBossEvery || BOSS_EVERY)) - 1;
+const baneKindFor = wave => BANE_KINDS[(G.baneOffset + bossIndex(wave)) % BANE_KINDS.length];
+function nextBossWave() {
+  const every = devBossEvery || BOSS_EVERY;
+  return Math.ceil(G.wave / every) * every;
 }
 
 const baneText = b => {
   const mine = (b.letters[NET.me] ?? []).map(l => l.toUpperCase()).join(', ');
   return `${BANES[b.kind].name}: ${BANES[b.kind].desc(mine)}`;
 };
+
+function showBossBanner(title, desc, color) {
+  const el = $('#bossBanner');
+  el.innerHTML = `<div class="bb-title" style="color:${hex(color)}">${esc(title)}</div><div class="bb-desc">${esc(desc)}</div>`;
+  el.hidden = false;
+  el.classList.remove('show');
+  void el.offsetWidth;
+  el.classList.add('show');
+  clearTimeout(showBossBanner._t);
+  showBossBanner._t = setTimeout(() => { el.hidden = true; }, 5000);
+}
 
 // ---------- phases
 
@@ -1351,6 +1457,10 @@ function hostStartWave() {
   const bane = isBossWave(G.wave) ? chooseBane() : null;
   G.players.forEach(p => { p.ready = false; });
   const spec = waveSpec(G.wave, G.players.length);
+  // (the ?bossEvery dev shortcut makes non-10 waves boss waves: give them a real boss)
+  if (isBossWave(G.wave) && !spec.list.some(e => e.type === 'boss')) {
+    spec.list.push({ type: 'boss', hp: Math.round(ENEMIES.boss.hp * 1.17 ** (G.wave - 1)), mod: null });
+  }
   spawnQueue = spec.list.slice();
   spawnInterval = spec.interval;
   if (isFocusWave(G.wave) && !G.focus) G.focus = pickFocus(); // e.g. a run started at a later wave
@@ -1364,13 +1474,17 @@ function hostStartWave() {
 function beginWave(bane, quiet = false) {
   G.bane = bane;
   G.phase = 'wave';
+  bossKilled = false;
   paused = false;
   prevCode = null;
   wave = { start: null, last: null, chars: 0, hits: 0, misses: 0, words: 0, clean: 0, gold: 0, keys: {} };
   setBaneWords(myBaneLetters());
   setFocusWords(G.focus ? focusLetters() : null);
   const news = [];
-  if (bane) news.push(`BOSS wave! ${baneText(bane)}`);
+  if (bane) {
+    const final = G.wave === finalWave() && !G.endless;
+    showBossBanner(`${final ? 'FINAL BOSS: ' : 'BOSS: '}${BANES[bane.kind].name}`, BANES[bane.kind].desc((bane.letters[NET.me] ?? []).map(l => l.toUpperCase()).join(', ')), BOSS_LOOKS[bane.kind].color);
+  }
   if (G.focus) news.push(`FOCUS wave: ${FOCUSES[G.focus].name}. Those letters come up much more, and towers on them deal +${Math.round(FOCUS_DAMAGE * 100)}% damage.`);
   for (const m of new Set(waveSpec(G.wave, G.players.length).list.map(e => e.mod).filter(Boolean))) {
     if (G.seenMods[m]) continue;
@@ -1385,14 +1499,22 @@ function beginWave(bane, quiet = false) {
   document.activeElement?.blur?.();
 }
 
+let bossKilled = false; // host/solo: did the towers kill this wave's boss (rather than it escaping)?
+
 function hostEndWave() {
   const focus = isFocusWave(G.wave + 1) ? pickFocus() : null;
-  toGuests({ t: 'waveEnd', focus });
-  onWaveEnd(focus);
+  toGuests({ t: 'waveEnd', focus, bossKilled });
+  onWaveEnd(focus, bossKilled);
 }
 
-function onWaveEnd(nextFocus = null) {
-  const clearedBoss = isBossWave(G.wave);
+// Keystrokes still in flight when a wave ends (you're usually mid-word) must not pick cards or
+// bridges, so menus ignore typing for a moment after each wave.
+let inputLockUntil = 0;
+
+function onWaveEnd(nextFocus = null, killedBoss = false) {
+  inputLockUntil = performance.now() + 1200;
+  const clearedBoss = isBossWave(G.wave) && killedBoss; // the bridge reward is for beating the boss
+  if (isBossWave(G.wave) && !killedBoss) setTimeout(() => toast("The boss got through, so there's no bridge this time."), 4600);
   G.bane = null;
   G.focus = nextFocus;
   setBaneWords(null);
@@ -1405,15 +1527,50 @@ function onWaveEnd(nextFocus = null) {
   best = Math.max(best, G.wave);
   try { localStorage.setItem(BEST_KEY, best); } catch { /* storage unavailable */ }
   G.wave++;
+  if (G.wave - 1 === finalWave() && !G.endless) return showVictory(clearedBoss);
+  afterWaveRewards(clearedBoss);
+}
+
+function afterWaveRewards(clearedBoss) {
   if (clearedBoss && myItems().size) openBridgePick();
   else openDraft(1);
+}
+
+// ---------- victory at wave 20 (then optionally endless)
+
+let pendingBossReward = false;
+function showVictory(clearedBoss) {
+  pendingBossReward = clearedBoss;
+  G.phase = 'victory';
+  const t = G.totals, acc = t.hits / Math.max(1, t.hits + t.misses);
+  const host = NET.role !== 'guest';
+  const msg = $('#centerMsg');
+  msg.innerHTML = `<div class="box victory"><h2>Victory! You held the line for ${finalWave()} waves</h2>
+    <p>Lives left: <b>${G.lives}</b>/${START_LIVES} · damage dealt: <b>${fmtNum(Math.round(dmgTotal[NET.me] || timeline.at(-1)?.p[NET.me]?.[0] || 0))}</b> · gold earned: <b>${fmtNum(Math.floor(G.goldEarned))}</b></p>
+    <p>Your words: ${t.clean}/${t.words} clean · accuracy ${(acc * 100).toFixed(1)}% · average ${myAvgWpm()} wpm · ${myItems().size} towers</p>
+    ${host ? `<button id="endlessBtn">Keep going (endless)</button> <button id="againBtn" class="ghostbtn">Play again</button>`
+      : '<p>Waiting for the host to choose: keep going or play again…</p>'}</div>`;
+  msg.hidden = false;
+  $('#endlessBtn')?.addEventListener('click', () => { toGuests({ t: 'continue' }); continueEndless(); });
+  $('#againBtn')?.addEventListener('click', playAgain);
+  setTextState();
+  renderShop();
+  renderHud();
+}
+
+function continueEndless() {
+  if (G.phase !== 'victory') return;
+  G.endless = true;
+  $('#centerMsg').hidden = true;
+  inputLockUntil = performance.now() + 600;
+  afterWaveRewards(pendingBossReward);
 }
 
 // ---------- boss reward: build a bridge
 
 function openBridgePick(fromBoss = true) {
   G.phase = 'bridge';
-  G.bridgePick = { from: null, fromBoss };
+  G.bridgePick = { from: null, to: null, fromBoss };
   setTextState();
   renderBridgePick();
   renderShop();
@@ -1428,15 +1585,19 @@ function bridgeChoose(code) {
     B.from = code;
     kb.setSelected(code);
   } else {
-    if (code === B.from) { B.from = null; kb.setSelected(null); }
+    if (code === B.from) { B.from = null; B.to = null; kb.setSelected(null); }
     else if (!myItems().has(code)) return toast(`${keyLabel(code)} has no tower. Pick one of your towers to link to.`);
-    else {
-      changeBridge(B.from, code);
-      toast(`Bridge built: typing ${keyLabel(B.from)} also fires your ${ITEMS[myItems().get(code).type].name} on ${keyLabel(code)}.`);
-      return finishBridgePick();
-    }
+    else B.to = code; // wait for confirmation
   }
   renderBridgePick();
+}
+
+function confirmBridge() {
+  const B = G.bridgePick;
+  if (G.phase !== 'bridge' || !B?.from || !B.to) return;
+  changeBridge(B.from, B.to);
+  toast(`Bridge built: typing ${keyLabel(B.from)} also fires your ${ITEMS[myItems().get(B.to).type].name} on ${keyLabel(B.to)}.`);
+  finishBridgePick();
 }
 
 function finishBridgePick() {
@@ -1460,23 +1621,24 @@ function renderBridgePick() {
     return it.type === 'mine' ? `+${(d.gold * it.level * pm).toFixed(1)} gold` : d.support ? 'pulse' : `${Math.round(d.dmg * POWER[it.level] * pm)} dmg`;
   };
   el.innerHTML = `<div class="dtitle">Boss defeated! Reward: build a bridge
-      <span class="dstep">${B.from ? `Now type one of your towers' keys to link ${keyLabel(B.from)} to` : 'Type the key to link FROM (it doesn\'t need a tower)'}</span></div>
+      <span class="dstep">${B.to ? `Press Enter to build ${keyLabel(B.from)} → ${keyLabel(B.to)}` : B.from ? `Now type one of your towers' keys to link ${keyLabel(B.from)} to` : 'Type the key to link FROM (it doesn\'t need a tower)'}</span></div>
     <p class="bridgehelp">Whenever you type the first key, the linked tower fires too, at ${Math.round(BRIDGE_POWER * 100)}% power with the first key's strength.
       Common letters make the best triggers: they fire the bridge most often.</p>
     <div class="bridgerow">${B.from
       ? `<span class="bfrom">${keyLabel(B.from)} <small>${FREQ_BY_LETTER[fromKey].pctLetters}% of letters</small></span><span class="barrow">→</span>
-         <div class="bchips">${towers.map(([c, it]) => `<button class="bchip" data-bkey="${c}" style="--c:${hex(ITEMS[it.type].color)}"><b>${keyLabel(c)}</b> ${ITEMS[it.type].name} <small>${preview(c, it)}/press</small></button>`).join('')}</div>`
+         <div class="bchips">${towers.map(([c, it]) => `<button class="bchip ${c === B.to ? 'on' : ''}" data-bkey="${c}" style="--c:${hex(ITEMS[it.type].color)}"><b>${keyLabel(c)}</b> ${ITEMS[it.type].name} <small>${preview(c, it)}/press</small></button>`).join('')}</div>`
       : `<div class="bchips">${suggestions.map(c => `<button class="bchip" data-bkey="${c}"><b>${keyLabel(c)}</b> <small>${FREQ_BY_LETTER[letterOf(c)].pctLetters}%</small></button>`).join('')}<span class="muted" style="align-self:center">…or type any letter</span></div>`}
     </div>
     ${mine.bridges.size ? `<p class="bridgehelp">Your bridges: ${[...mine.bridges].map(([f, b]) => `${keyLabel(f)} → ${keyLabel(b.to)}`).join(' · ')}</p>` : ''}
-    <div class="dfoot">${B.from ? '<button id="bridgeBack">← Change first key <kbd>Backspace</kbd></button>' : ''}<button id="bridgeSkip">Skip (+${SKIP_GOLD}g) <kbd>Esc</kbd></button></div>`;
+    <div class="dfoot">${B.from ? '<button id="bridgeBack">← Change first key <kbd>Backspace</kbd></button>' : ''}${B.to ? `<button id="bridgeOk" class="okbtn">Build bridge ${keyLabel(B.from)} → ${keyLabel(B.to)} <kbd>Enter</kbd></button>` : ''}<button id="bridgeSkip">Skip (+${SKIP_GOLD}g) <kbd>Esc</kbd></button></div>`;
 }
 
 $('#draft').addEventListener('click', e => {
   if (G.phase !== 'bridge') return;
   const chip = e.target.closest('[data-bkey]');
   if (chip) bridgeChoose(chip.dataset.bkey);
-  else if (e.target.closest('#bridgeBack')) { G.bridgePick.from = null; kb.setSelected(null); renderBridgePick(); }
+  else if (e.target.closest('#bridgeOk')) confirmBridge();
+  else if (e.target.closest('#bridgeBack')) { G.bridgePick.from = null; G.bridgePick.to = null; kb.setSelected(null); renderBridgePick(); }
   else if (e.target.closest('#bridgeSkip')) {
     G.gold += SKIP_GOLD;
     G.goldEarned += SKIP_GOLD;
@@ -1496,7 +1658,7 @@ function showGameOver() {
   const cleared = G.wave - 1;
   const t = G.totals, acc = t.hits / Math.max(1, t.hits + t.misses);
   const msg = $('#centerMsg');
-  msg.innerHTML = `<div class="box"><h2>The line broke on wave ${G.wave}</h2>
+  msg.innerHTML = `<div class="box"><h2>${G.endless ? `Endless run over on wave ${G.wave}` : `The line broke on wave ${G.wave}`}</h2>
     <p>Waves cleared: <b>${cleared}</b>${cleared > 0 && cleared >= best ? ' (new best!)' : ` · best ${best}`}</p>
     <p>Your words: ${t.clean}/${t.words} clean · accuracy ${(acc * 100).toFixed(1)}% · ${myItems().size} towers</p>
     ${NET.role === 'guest' ? '<p>Waiting for the host to start another game…</p><button id="leaveBtn">Leave room</button>'
@@ -1512,8 +1674,9 @@ function showGameOver() {
 function playAgain() {
   if (NET.role === 'guest') return;
   const players = G.players.filter(p => p.online).map(({ name, id }) => ({ name, id }));
-  if (NET.role === 'host') toGuests({ t: 'start', players });
-  startGame(players);
+  const baneOffset = Math.floor(Math.random() * BANE_KINDS.length);
+  if (NET.role === 'host') toGuests({ t: 'start', players, baneOffset });
+  startGame(players, baneOffset);
 }
 
 // Remove everything from the previous run (towers, enemies) before laying out a new one.
@@ -1529,10 +1692,11 @@ function clearRun() {
   setBaneWords(null);
 }
 
-function startGame(players) {
+function startGame(players, baneOffset = Math.floor(Math.random() * BANE_KINDS.length)) {
   clearRun();
   NET.me = Math.max(0, players.findIndex(p => p.id === CLIENT_ID));
   G = newGame(players);
+  G.baneOffset = baneOffset;
   nextEnemyId = 1;
   NET.started = true;
   setLanePlayers(players.length);
@@ -1808,8 +1972,9 @@ $('#lobby').addEventListener('click', async e => {
     $('#linkInput').select();
     try { await navigator.clipboard.writeText($('#linkInput').value); lobbyMsg('Link copied.'); } catch { lobbyMsg('Select the link and copy it.'); }
   } else if (id === 'startBtnLobby') {
-    toGuests({ t: 'start', players: NET.lobby });
-    startGame(NET.lobby);
+    const baneOffset = Math.floor(Math.random() * BANE_KINDS.length);
+    toGuests({ t: 'start', players: NET.lobby, baneOffset });
+    startGame(NET.lobby, baneOffset);
   } else if (id === 'cancelBtn') {
     leaveRoom();
   }
@@ -1946,6 +2111,7 @@ function hostSync() {
       bridges: [...p.bridges].map(([f, b]) => [f, b.to]),
     })),
     wave: G.wave, lives: G.lives, inWave: G.phase === 'wave', over: G.phase === 'over', bane: G.bane, focus: G.focus,
+    endless: G.endless, victory: G.phase === 'victory', baneOffset: G.baneOffset,
     enemies: enemies.filter(e => !e.dead).map(e => ({
       id: e.id, type: e.type, hp: e.hp, maxHp: e.maxHp, mod: e.mod, lock: e.lock,
       bane: e.bane ? { kind: e.bane.kind, letters: e.bane.letters } : null, dist: e.dist, haste: e.haste, shield: e.shield,
@@ -2082,6 +2248,8 @@ function applySync(msg) {
   });
   G.lives = msg.lives;
   G.focus = msg.focus ?? null;
+  G.endless = !!msg.endless;
+  G.baneOffset = msg.baneOffset ?? G.baneOffset;
   for (const e of [...enemies]) removeEnemy(e);
   enemies = [];
   for (const spec of msg.enemies) {
@@ -2094,6 +2262,9 @@ function applySync(msg) {
   if (msg.over) {
     G.wave = msg.wave;
     showGameOver();
+  } else if (msg.victory) {
+    G.wave = msg.wave;
+    if (G.phase !== 'victory') showVictory(false);
   } else if (msg.inWave) {
     G.wave = msg.wave;
     if (!wasInWave || !same) beginWave(msg.bane, true);
@@ -2213,7 +2384,7 @@ function guestMessage(msg) {
       renderLobby('joined');
       break;
     case 'start':
-      startGame(msg.players);
+      startGame(msg.players, msg.baneOffset ?? 0);
       break;
     case 'key':
       pressKey(msg.pid, msg.code);
@@ -2264,10 +2435,13 @@ function guestMessage(msg) {
       for (const e of [...enemies]) removeEnemy(e);
       enemies = [];
       spawnQueue = [];
-      onWaveEnd(msg.focus ?? null);
+      onWaveEnd(msg.focus ?? null, !!msg.bossKilled);
       break;
     case 'over':
       showGameOver();
+      break;
+    case 'continue':
+      continueEndless();
       break;
     case 'left':
     case 'back':
@@ -2300,7 +2474,7 @@ function renderHud() {
 function effectText(it, code) {
   const d = ITEMS[it.type], pm = keyPowerMult(letterOf(code));
   if (it.type === 'mine') return `+${(d.gold * it.level * pm).toFixed(1)}g/press`;
-  if (d.support) return `+${Math.round((d.boost + 0.15 * (it.level - 1)) * 100)}% to ${ampNeighbours(code).map(c => keyLabel(c)).join(' ')}`;
+  if (d.support) return `+${Math.round((d.boost + 0.15 * (it.level - 1)) * 100)}% · ${ampHint(code)}`;
   const amp = ampBonus(NET.me, code);
   return `${Math.round(d.dmg * POWER[it.level] * pm * amp)} dmg/shot${amp > 1 ? ' (amped)' : ''}`;
 }
@@ -2357,7 +2531,8 @@ function renderShop() {
   const toBoss = BOSS_EVERY - ((G.wave - 1) % BOSS_EVERY) - 1;
   const startLabel = open ? (isMulti() ? `Ready for wave ${G.wave} ▶` : `Start wave ${G.wave} ▶`)
     : G.phase === 'ready' ? `Waiting for ${waitingFor().join(', ')}…`
-    : G.phase === 'draft' ? 'Choose a card first' : G.phase === 'over' ? 'Game over' : `Wave ${G.wave} in progress`;
+    : G.phase === 'draft' ? 'Choose a card first' : G.phase === 'over' ? 'Game over'
+    : G.phase === 'victory' ? 'Victory!' : G.phase === 'bridge' ? 'Build your bridge first' : `Wave ${G.wave} in progress`;
   html += `<div class="card">
     <p class="hint" style="margin-top:0">${G.phase === 'wave' ? 'This' : 'Next'} wave: ${Object.entries(next).map(([t, n]) => `${n} ${ENEMIES[t].name.toLowerCase()}${n > 1 ? 's' : ''}`).join(', ')}${
       Object.keys(mods).length ? ` <span class="modlist">(${Object.entries(mods).map(([m, n]) => `<span title="${MODS[m].desc}">${n} ${MODS[m].name.toLowerCase()}</span>`).join(', ')})</span>` : ''}${
@@ -2365,8 +2540,8 @@ function renderShop() {
     ${G.focus ? `<div class="focusnote"><b>Focus wave: ${FOCUSES[G.focus].name}</b> (${FOCUSES[G.focus].letters.toUpperCase().split('').join(' ')}). These letters come up much more often and towers on them deal +${Math.round(FOCUS_DAMAGE * 100)}% damage this wave. They're tinted teal on your keyboard.</div>` : ''}
     ${G.players[NET.me].bridges.size ? `<div class="scout">Bridges: ${[...G.players[NET.me].bridges].map(([f, b]) => `<span class="chip">${keyLabel(f)}</span>→<span class="chip">${keyLabel(b.to)}</span>`).join(' ')}</div>` : ''}
     <div class="scout">${isBossWave(G.wave)
-      ? `<b class="bosswarn">Boss wave!</b> It gets a bane built from your slowest keys${slow.length ? `: <b>${slow.map(k => keyLabel(k.code)).join(' ')}</b>` : ''}. Beat it to earn a bridge.`
-      : `<b>Boss in ${toBoss} wave${toBoss === 1 ? '' : 's'}.</b> Scouting your slowest keys: ${slow.length
+      ? `<b class="bosswarn">${G.wave === finalWave() && !G.endless ? 'Final boss' : 'Boss'} wave: <span style="color:${hex(BOSS_LOOKS[baneKindFor(G.wave)].color)}">${BANES[baneKindFor(G.wave)].name}</span>!</b> ${BANES[baneKindFor(G.wave)].desc(slow.length ? slow.map(k => keyLabel(k.code)).join(', ') : 'your slowest keys')} Beat it to earn a bridge.`
+      : `<b>Boss in ${toBoss} wave${toBoss === 1 ? '' : 's'}: ${nextBossWave() === finalWave() && !G.endless ? 'final boss, ' : ''}<span style="color:${hex(BOSS_LOOKS[baneKindFor(nextBossWave())].color)}">${BANES[baneKindFor(nextBossWave())].name}</span>.</b> ${BANES[baneKindFor(nextBossWave())].desc('your slowest keys')} Scouting them: ${slow.length
         ? slow.map(k => `<span class="chip">${keyLabel(k.code)}</span> ${Math.round(k.ms)}ms`).join(' · ')
         : 'keep typing…'}`}</div>
     <button class="startbtn" id="startBtn" ${open ? '' : 'disabled'}>${startLabel}</button>
@@ -2442,9 +2617,17 @@ window.addEventListener('keydown', e => {
     if (e.key === 'Enter' && NET.role !== 'guest') playAgain();
     return;
   }
+  if (G.phase !== 'wave' && performance.now() < inputLockUntil) return; // leftover keystrokes from the wave
+  if (G.phase === 'victory') {
+    if (e.key === 'Enter' && NET.role !== 'guest') { toGuests({ t: 'continue' }); continueEndless(); }
+    return;
+  }
   if (G.phase === 'bridge') {
+    const B = G.bridgePick;
     if (e.key === 'Escape') { G.gold += SKIP_GOLD; G.goldEarned += SKIP_GOLD; finishBridgePick(); }
-    else if (e.key === 'Backspace' && G.bridgePick.from) { G.bridgePick.from = null; kb.setSelected(null); renderBridgePick(); }
+    else if (e.key === 'Enter') confirmBridge();
+    else if (e.key === 'Backspace' && B.to) { B.to = null; renderBridgePick(); }
+    else if (e.key === 'Backspace' && B.from) { B.from = null; kb.setSelected(null); renderBridgePick(); }
     else if (isLetterCode(e.code)) bridgeChoose(e.code);
     return;
   }
@@ -2539,6 +2722,8 @@ let devBridge = false;
 function applyDevParams() {
   const params = new URLSearchParams(location.search);
   devBridge = params.has('bridge');
+  devBossEvery = Number(params.get('bossEvery')) || 0;
+  devFinal = Number(params.get('final')) || 0;
   if (!params.has('wave') && !params.has('gold')) return;
   if (params.has('wave')) G.wave = Math.max(1, Number(params.get('wave')) || 1);
   G.focus = isFocusWave(G.wave) ? pickFocus() : null;

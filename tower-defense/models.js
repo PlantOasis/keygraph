@@ -22,7 +22,9 @@ export function textSprite(text, color) {
   c.width = 256;
   c.height = 64;
   const g = c.getContext('2d');
-  g.font = '700 40px system-ui, -apple-system, sans-serif';
+  let size = 40;
+  g.font = `700 ${size}px system-ui, -apple-system, sans-serif`;
+  while (size > 16 && g.measureText(text).width > 244) g.font = `700 ${--size}px system-ui, -apple-system, sans-serif`;
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   g.fillStyle = color;

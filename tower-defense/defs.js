@@ -30,8 +30,8 @@ export const ITEMS = {
     desc: 'Shoots the enemy closest to the goal.',
   },
   frost: {
-    name: 'Frost', weight: 18, cost: 70, color: 0x9be7ff, dmg: 4, slow: 0.45, slowTime: 2,
-    desc: 'Small hit that slows the lead enemy by 45%.',
+    name: 'Frost', weight: 18, cost: 70, color: 0x9be7ff, dmg: 6, slow: 0.6, slowTime: 2, slowRadius: 1.2,
+    desc: 'Chills the lead enemy and everything near it: 60% slower for 2 s.',
   },
   cannon: {
     name: 'Cannon', weight: 16, cost: 110, color: 0xff8a50, dmg: 16, splash: 1.6,
@@ -50,16 +50,16 @@ export const ITEMS = {
     desc: 'Gold every time you type this key. Pays more per press on rare letters.',
   },
   poison: {
-    name: 'Poison', weight: 14, cost: 90, color: 0x7ee06a, dmg: 3, dot: 5, dotTime: 4,
-    desc: 'Poisons the lead enemy: 5 damage per second for 4 s. Stacks.',
+    name: 'Poison', weight: 14, cost: 90, color: 0x7ee06a, dmg: 3, dot: 8, dotTime: 4,
+    desc: 'Poisons the lead enemy: 8 damage per second for 4 s. Stacks.',
   },
   mortar: {
-    name: 'Mortar', weight: 10, cost: 130, color: 0xa1887f, dmg: 22, splash: 2.2,
-    desc: 'Lobs a heavy shell at the most crowded spot in the lane.',
+    name: 'Mortar', weight: 10, cost: 130, color: 0xa1887f, dmg: 15, splash: 2.2, otherShare: 0.6,
+    desc: 'Lobs a heavy shell at the most crowded spot. Others in the blast take 60%.',
   },
   gust: {
-    name: 'Gust', weight: 12, cost: 80, color: 0x80deea, dmg: 2, push: 1.2,
-    desc: 'Blows the lead enemy back toward the start. Bosses barely budge.',
+    name: 'Gust', weight: 12, cost: 80, color: 0x80deea, dmg: 5, push: 1.6, targets: 2,
+    desc: 'Blows the two lead enemies back toward the start. Bosses barely budge.',
   },
   amp: {
     name: 'Amplifier', weight: 10, cost: 100, color: 0xf48fb1, boost: 0.35, support: true,
@@ -70,8 +70,8 @@ export const ITEMS = {
     desc: 'Triple damage when its letter is the first letter of a word.',
   },
   focus: {
-    name: 'Focus', weight: 10, cost: 110, color: 0xff5252, dmg: 6, perStreak: 0.25, maxStreak: 12,
-    desc: '+25% damage for every clean word in your current streak (up to +300%).',
+    name: 'Focus', weight: 10, cost: 110, color: 0xff5252, dmg: 6, perStreak: 0.35, maxStreak: 12,
+    desc: '+35% damage for every clean word in your current streak (up to +420%).',
   },
 };
 export const ITEM_ORDER = ['blaster', 'frost', 'cannon', 'tesla', 'rail', 'poison', 'mortar', 'gust', 'herald', 'focus', 'amp', 'mine'];
@@ -115,6 +115,9 @@ export const MODS = {
 
 // Every BOSS_EVERY waves a boss arrives with a bane built from your slowest keys this run.
 export const BOSS_EVERY = 10;
+// The three banes take turns (in an order set at the start of each game), so bosses 10, 20
+// and 30 are always different. Each has its own look.
+export const BANE_KINDS = ['lock', 'shield', 'frenzy'];
 export const BANES = {
   lock: { name: 'Lockjaw', desc: k => `Only takes damage while you type a word containing ${k}.` },
   shield: { name: 'Aegis', desc: k => `Shielded. A clean word containing ${k} opens the shield for 3 seconds.` },
@@ -178,3 +181,6 @@ export const FOCUS_DAMAGE = 0.4;
 // "to" key, at half power and using the FROM key's per-shot strength, so a bridge from a common
 // key to a rare-key tower doesn't multiply that tower's big hits. One per key, no chains.
 export const BRIDGE_POWER = 0.5;
+
+// Beating this wave's boss wins the game; players can then keep going in endless mode.
+export const FINAL_WAVE = 20;
