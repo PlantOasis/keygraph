@@ -156,3 +156,25 @@ export function waveSpec(n, players = 1) {
 }
 
 export const waveBonus = n => 25 + 5 * n;
+
+// ---------- Focus waves: on waves 3, 5, 7 (13, 15, 17, …) one region of the keyboard comes up far
+// more in the words, and towers on it hit harder. It's announced in the shop beforehand.
+export const isFocusWave = n => [3, 5, 7].includes(n % 10);
+export const FOCUSES = {
+  left: { name: 'Left hand', letters: 'qwertasdfgzxcvb' },
+  right: { name: 'Right hand', letters: 'yuiophjklnm' },
+  top: { name: 'Top row', letters: 'qwertyuiop' },
+  home: { name: 'Home row', letters: 'asdfghjkl' },
+  bottom: { name: 'Bottom row', letters: 'zxcvbnm' },
+  index: { name: 'Index fingers', letters: 'rtfgvbyuhjnm' },
+  outer: { name: 'Ring & pinky fingers', letters: 'qazwsxolp' },
+};
+// word weight × FOCUS_WORD_BIAS^(share of the word's letters in the region): lifts the region's
+// share of typing by about 1.25–1.5×; with the damage bonus, its towers do roughly 2× as much.
+export const FOCUS_WORD_BIAS = 30;
+export const FOCUS_DAMAGE = 0.4;
+
+// ---------- Bridges: a reward for each boss. Typing the "from" key also fires the tower on the
+// "to" key, at half power and using the FROM key's per-shot strength, so a bridge from a common
+// key to a rare-key tower doesn't multiply that tower's big hits. One per key, no chains.
+export const BRIDGE_POWER = 0.5;

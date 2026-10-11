@@ -4,16 +4,27 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Key Defense</title>
-  <link rel="stylesheet" href="../css/style.css">
-  <link rel="stylesheet" href="game.css">
+  <link rel="stylesheet" href="../css/style.css?v=2026-10-10b">
+  <link rel="stylesheet" href="game.css?v=2026-10-10b">
   <script type="importmap">
   {
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "./defs.js": "./defs.js?v=2026-10-10b",
+      "./models.js": "./models.js?v=2026-10-10b",
+      "./net.js": "./net.js?v=2026-10-10b",
+      "./letter-frequency.js": "./letter-frequency.js?v=2026-10-10b",
+      "../js/keyboard3d.js": "../js/keyboard3d.js?v=2026-10-10b",
+      "../js/layout.js": "../js/layout.js?v=2026-10-10b",
+      "../js/stats.js": "../js/stats.js?v=2026-10-10b",
+      "../js/words.js": "../js/words.js?v=2026-10-10b",
+      "../js/colors.js": "../js/colors.js?v=2026-10-10b"
     }
   }
   </script>
+  <!-- Bump the ?v= version (here, below, and in the import map) on every release so browsers
+       never mix a new game.js with cached old modules. -->
   <!-- PeerJS: browser-to-browser connections for multiplayer rooms -->
   <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 </head>
@@ -35,6 +46,7 @@
         <div class="kb game-kb" id="kb"></div>
         <button class="viewbtn" id="viewBtn" hidden></button>
         <div class="statspanel" id="statsPanel" hidden></div>
+        <div class="netbanner" id="netBanner" hidden></div>
         <div class="center-msg" id="lobby" hidden></div>
         <div class="center-msg" id="centerMsg" hidden></div>
         <div class="tooltip" id="tooltip"></div>
@@ -45,6 +57,6 @@
     <aside class="shop" id="shop"></aside>
   </main>
 
-  <script type="module" src="game.js"></script>
+  <script type="module" src="game.js?v=2026-10-10b"></script>
 </body>
 </html>

@@ -10,6 +10,7 @@ import {
   upgradeCost, scrapValue, waveSpec, waveBonus, keyCostMult, keyPowerMult,
   OPENING_PICKS, OPENING_KEY_POOL, SKIP_GOLD, rerollCost,
   NON_OPENING, AMP_RANGE, MODS, BOSS_EVERY, BANES, BANE_WORD_SHARE, BOARD_GAP, setLanePlayers,
+  isFocusWave, FOCUSES, FOCUS_WORD_BIAS, FOCUS_DAMAGE, BRIDGE_POWER,
 } from './defs.js';
 import { GEO, hex, textSprite, buildItem, disposeTree, itemHSL, CardArt } from './models.js';
 import { Room, MAX_PLAYERS } from './net.js';
@@ -31,7 +32,7 @@ const fingers = new FingerTracker();
 // ---------- network role
 // solo: no network. host: runs the official game (enemies, damage, lives) and relays.
 // guest: mirrors the host's enemies and sends its keystrokes; keeps its own gold/drafts/upgrades.
-const NET = { role: 'solo', room: null, me: 0, lobby: [], started: false };
+const NET = { role: 'solo', room: null, me: 0, lobby: [], started: false, epoch: 0, hostId: null, peers: new Map() };
 const isAuth = () => NET.role !== 'guest';
 const isMulti = () => NET.role !== 'solo';
 const toHost = msg => NET.room?.send(msg);
@@ -39,7 +40,7 @@ const toGuests = (msg, except) => NET.room?.broadcast(msg, except);
 
 // ---------- game state
 
-// players: [{ name, id }] — id is the PeerJS id ('host' for the host), used to route guest messages.
+// players: [{ name, id }] — id is each tab's CLIENT_ID, which survives reloads and reconnects.
 function newGame(players) {
   return {
     phase: 'draft',  // 'lobby' | 'draft' | 'shop' | 'ready' (waiting for others) | 'wave' | 'over'
@@ -47,17 +48,23 @@ function newGame(players) {
     wave: 1,
     gold: START_GOLD,     // this player's gold
     lives: START_LIVES,   // shared
-    players: players.map(p => ({ name: p.name, id: p.id, items: new Map(), ready: false, slow: [], online: true })),
+    players: players.map(p => ({ name: p.name, id: p.id, items: new Map(), bridges: new Map(), ready: false, slow: [], online: true })),
     totals: { words: 0, clean: 0, hits: 0, misses: 0, kills: 0, mined: 0 },
+    goldEarned: 0,    // every bit of gold earned this game (spending doesn't reduce it)
+    waveChars: 0,     // correct characters typed during waves
+    waveSecs: 0,      // time spent in waves
     streak: 0,        // this player's consecutive clean words
     keyTimes: {},     // this run's typing speed per letter key: code -> { sum, n }
     bane: null,       // active boss bane: { kind, letters: { [pid]: [l, l, l] } }
+    focus: null,      // focus region for the current/upcoming wave (key of FOCUSES)
+    lastFocus: null,
+    bridgePick: null, // boss reward in progress: { from }
     lastBane: null,
     seenMods: {},
   };
 }
 
-let G = newGame([{ name: 'You', id: 'host' }]);
+let G = newGame([{ name: 'You', id: 'local' }]);
 G.phase = 'lobby';
 let enemies = [], fx = [], spawnQueue = [], spawnTimer = 0, spawnInterval = 1, nextEnemyId = 1, snapTimer = 0;
 let time = 0, paused = false;
@@ -303,6 +310,7 @@ function setItem(pid, code, type, level) {
       if (cur.obj) disposeTree(cur.obj);
       removeAura(cur);
       items.delete(code);
+      for (const [from, b] of [...G.players[pid].bridges]) if (b.to === code) setBridge(pid, from, null);
     }
     paintKey(pid, code);
     return;
@@ -334,7 +342,7 @@ function paintKey(pid, code) {
       const [h, s] = itemHSL(type);
       hsl = [h, Math.min(1, s * 2), 0.5];
     }
-  }
+  } else if (G.focus && G.phase !== 'over' && inFocus(code)) hsl = [0.47, 0.45, 0.3]; // focus region: teal
   setKeyColor(pid, code, hsl);
 }
 const paintKeys = () => G.players.forEach((p, pid) => KEYS.forEach(k => paintKey(pid, k.code)));
@@ -464,7 +472,7 @@ function damage(e, dmg, it, quiet = false) {
   if (!quiet) e.flashUntil = time + 0.08;
   if (it) {
     it.damage += dealt;
-    if (it.pid != null) dmgAcc[it.pid] = (dmgAcc[it.pid] || 0) + dealt;
+    if (it.pid != null) dmgTotal[it.pid] = (dmgTotal[it.pid] || 0) + dealt;
   }
   if (e.hp <= 0) {
     popFx(e.group.position.clone(), e.def.color, e.def.size);
@@ -570,11 +578,84 @@ function ampBonus(pid, code) {
 }
 const ampNeighbours = code => LETTER_CODES.filter(c => c !== code && travel(code, c).dist <= AMP_RANGE);
 
-// A correctly typed letter fires that player's tower on the key.
+// ---------- focus waves
+
+const focusLetters = () => (G.focus ? FOCUSES[G.focus].letters : '');
+const inFocus = code => !!G.focus && focusLetters().includes(letterOf(code));
+
+function pickFocus() {
+  const kinds = Object.keys(FOCUSES).filter(k => k !== G.lastFocus);
+  const kind = kinds[Math.floor(Math.random() * kinds.length)];
+  G.lastFocus = kind;
+  return kind;
+}
+
+// ---------- bridges: typing the "from" key also fires the tower on the "to" key
+
+function bridgeCurve(pid, from, to) {
+  const top = code => {
+    const k = KEY_BY_CODE[code];
+    return new THREE.Vector3(k.x + k.w / 2, KEY_Y + 0.3, k.y + 0.5);
+  };
+  const a = top(from), b = top(to), mid = a.clone().lerp(b, 0.5);
+  mid.y += 0.9 + a.distanceTo(b) * 0.22;
+  return new THREE.QuadraticBezierCurve3(a, mid, b);
+}
+
+function setBridge(pid, from, to) {
+  const P = G.players[pid];
+  if (!P) return;
+  const old = P.bridges.get(from);
+  if (old) {
+    old.mesh.parent?.remove(old.mesh);
+    disposeTree(old.mesh);
+    P.bridges.delete(from);
+  }
+  if (!to || !boards[pid]) return;
+  const curve = bridgeCurve(pid, from, to);
+  const mesh = new THREE.Group();
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffd36b, transparent: true, opacity: 0.7, depthWrite: false });
+  mesh.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 40, 0.06, 8, false), mat));
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.3, 12), mat);
+  head.position.copy(curve.getPoint(0.94));
+  head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), curve.getTangent(0.94).normalize());
+  mesh.add(head);
+  boards[pid].root.add(mesh);
+  P.bridges.set(from, { to, mesh, flash: 0 });
+}
+
+// Local change: apply and tell everyone.
+function changeBridge(from, to) {
+  setBridge(NET.me, from, to);
+  if (NET.role === 'host') toGuests({ t: 'bridge', pid: NET.me, from, to });
+  else if (NET.role === 'guest') toHost({ t: 'bridge', from, to });
+}
+
+function animateBridges(now) {
+  for (const P of G.players) {
+    for (const b of P.bridges.values()) {
+      const flare = Math.max(0, 1 - (now - b.flash) / 300);
+      b.mesh.children.forEach(m => { m.material.opacity = 0.6 + 0.12 * Math.sin(now / 500) + 0.4 * flare; });
+    }
+  }
+}
+
+// A correctly typed letter fires that player's tower on the key, then anything bridged from it.
 // ctx: { word, first, streak }. auth: apply damage/effects (host/solo) or just show the shot (guests).
 function fire(pid, code, ctx, auth) {
+  fireTower(pid, code, ctx, auth);
+  const b = G.players[pid]?.bridges.get(code);
+  if (b && G.players[pid].items.has(b.to)) {
+    b.flash = performance.now();
+    fireTower(pid, b.to, ctx, auth, code);
+  }
+}
+
+// via: the key that triggered this tower through a bridge (half power, with via's strength).
+function fireTower(pid, code, ctx, auth, via = null) {
   const it = G.players[pid]?.items.get(code);
   if (!it || !boards[pid]) return;
+  const strength = keyPowerMult(letterOf(via ?? code)) * (via ? BRIDGE_POWER : 1);
   const def = ITEMS[it.type];
   const from = keyTop(pid, code);
   from.y += 0.4;
@@ -582,8 +663,9 @@ function fire(pid, code, ctx, auth) {
 
   if (it.type === 'mine') {
     if (pid === NET.me) {
-      const g = def.gold * it.level * keyPowerMult(letterOf(code));
+      const g = def.gold * it.level * strength;
       G.gold += g;
+      G.goldEarned += g;
       G.totals.mined += g;
     }
     coinFx(from);
@@ -604,7 +686,8 @@ function fire(pid, code, ctx, auth) {
     ringFx(t.group.position.clone(), 0xaaaaaa, 0.5);
     return;
   }
-  let dmg = def.dmg * POWER[it.level] * keyPowerMult(letterOf(code)) * ampBonus(pid, code);
+  let dmg = def.dmg * POWER[it.level] * strength * ampBonus(pid, code);
+  if (G.phase === 'wave' && inFocus(code)) dmg *= 1 + FOCUS_DAMAGE;
   if (it.type === 'herald' && ctx.first) dmg *= def.startMult;
   if (it.type === 'focus') dmg *= 1 + def.perStreak * Math.min(ctx.streak, def.maxStreak);
   const hit = (e, d) => { if (auth) damage(e, d, it); };
@@ -666,7 +749,7 @@ function fire(pid, code, ctx, auth) {
       aim(it, from, t);
       boltFx(from, t, def.color, 0.07);
       if (auth) {
-        t.poisonDps = Math.min(def.dot * 6, t.poisonDps + def.dot * POWER[it.level] * keyPowerMult(letterOf(code)));
+        t.poisonDps = Math.min(def.dot * 6, t.poisonDps + def.dot * POWER[it.level] * strength);
         t.poisonUntil = time + def.dotTime;
         t.poisonSrc = it;
       }
@@ -842,7 +925,23 @@ function setBaneWords(letters) {
   baneTotal = baneWeights.reduce((a, b) => a + b, 0);
 }
 
+// Focus waves: words heavy in the focus region come up far more often.
+let focusWeights = null, focusTotal = 0;
+function setFocusWords(letters) {
+  if (!letters) { focusWeights = null; return; }
+  focusWeights = WORDS.map((w, i) => {
+    let n = 0;
+    for (const c of w) if (letters.includes(c)) n++;
+    return WORD_WEIGHTS[i] * FOCUS_WORD_BIAS ** (n / w.length);
+  });
+  focusTotal = focusWeights.reduce((a, b) => a + b, 0);
+}
+
 function pickWord() {
+  if (focusWeights) {
+    let r = Math.random() * focusTotal;
+    for (let i = 0; i < WORDS.length; i++) if ((r -= focusWeights[i]) <= 0) return WORDS[i];
+  }
   if (banePool?.length && Math.random() < BANE_WORD_SHARE) {
     let r = Math.random() * baneTotal;
     for (let i = 0; i < banePool.length; i++) if ((r -= baneWeights[i]) <= 0) return banePool[i];
@@ -878,7 +977,7 @@ function newText() {
     wordEl.className = 'word';
     for (const c of w + ' ') {
       const s = document.createElement('span');
-      s.className = 'ch' + (c === ' ' ? ' sp' : '') + (bane.includes(c) ? ' bane' : '');
+      s.className = 'ch' + (c === ' ' ? ' sp' : '') + (bane.includes(c) ? ' bane' : '') + (focusWeights && focusLetters().includes(c) ? ' focus' : '');
       s.textContent = c === ' ' ? '·' : c;
       wordEl.appendChild(s);
       spans.push(s);
@@ -934,7 +1033,7 @@ function typeChar(ch, physCode, t) {
   lastT = t;
   wave.chars++;
   wave.last = t;
-  typeTimes.push(performance.now());
+  G.waveChars++;
 
   spans[pos].classList.remove('cur');
   spans[pos].classList.add('done');
@@ -965,6 +1064,7 @@ function completeWord(wi) {
   else toHost({ t: 'clean', word: words[wi] });
   const g = words[wi].length;
   G.gold += g;
+  G.goldEarned += g;
   G.totals.clean++;
   wave.clean++;
   wave.gold += g;
@@ -988,13 +1088,15 @@ const waitingFor = () => G.players.filter(p => p.online && !p.ready).map(p => p.
 
 function setTextState() {
   const wrap = $('#textWrap'), ov = $('#textOverlay');
-  document.body.classList.toggle('drafting', G.phase === 'draft');
+  document.body.classList.toggle('drafting', G.phase === 'draft' || G.phase === 'bridge');
   wrap.classList.toggle('active', G.phase === 'wave' && !paused);
   ov.textContent = G.phase === 'lobby' ? 'Choose how to play'
+    : G.phase === 'bridge' ? 'Boss reward: type a key to link from, then one of your towers'
     : G.phase === 'shop' ? `Spend gold on upgrades, then press Enter when you're ready for wave ${G.wave}`
     : G.phase === 'ready' ? `Ready! Waiting for ${waitingFor().join(', ') || 'the host'}…`
     : paused ? 'Paused. Press Esc to continue' : '';
   ov.style.display = ov.textContent ? '' : 'none';
+  renderStats(); // the panel shows "paused" outside waves
 }
 
 // ---------- draft: 3 towers on top, 3 keys below; select a tower, then a key to place it
@@ -1055,6 +1157,9 @@ function nextDraftOrShop() {
     G.draft.rerolls = 0;
     deal();
     refreshDraft();
+  } else if (devBridge) {
+    devBridge = false;
+    openBridgePick(false);
   } else openShop();
 }
 
@@ -1097,6 +1202,7 @@ function rerollDraft() {
 function skipDraft() {
   if (G.phase !== 'draft' || !myItems().size) return;
   G.gold += SKIP_GOLD;
+  G.goldEarned += SKIP_GOLD;
   floatGold(`+${SKIP_GOLD}`);
   nextDraftOrShop();
 }
@@ -1149,6 +1255,7 @@ function keyCardHTML(code, i) {
 function renderDraft() {
   const el = $('#draft');
   el.hidden = G.phase !== 'draft';
+  if (G.phase === 'bridge') return renderBridgePick();
   paintKeys();
   if (el.hidden) return;
   const D = G.draft, opening = G.wave === 1;
@@ -1243,31 +1350,34 @@ function hostCheckReady() {
 function hostStartWave() {
   const bane = isBossWave(G.wave) ? chooseBane() : null;
   G.players.forEach(p => { p.ready = false; });
-  toGuests({ t: 'wave', wave: G.wave, bane });
   const spec = waveSpec(G.wave, G.players.length);
   spawnQueue = spec.list.slice();
   spawnInterval = spec.interval;
+  if (isFocusWave(G.wave) && !G.focus) G.focus = pickFocus(); // e.g. a run started at a later wave
+  toGuests({ t: 'wave', wave: G.wave, bane, focus: G.focus, queue: spawnQueue, interval: spawnInterval });
   spawnTimer = 0.6;
   snapTimer = 0;
   beginWave(bane);
 }
 
 // Every client: the wave is on.
-function beginWave(bane) {
+function beginWave(bane, quiet = false) {
   G.bane = bane;
   G.phase = 'wave';
   paused = false;
   prevCode = null;
   wave = { start: null, last: null, chars: 0, hits: 0, misses: 0, words: 0, clean: 0, gold: 0, keys: {} };
   setBaneWords(myBaneLetters());
+  setFocusWords(G.focus ? focusLetters() : null);
   const news = [];
   if (bane) news.push(`BOSS wave! ${baneText(bane)}`);
+  if (G.focus) news.push(`FOCUS wave: ${FOCUSES[G.focus].name}. Those letters come up much more, and towers on them deal +${Math.round(FOCUS_DAMAGE * 100)}% damage.`);
   for (const m of new Set(waveSpec(G.wave, G.players.length).list.map(e => e.mod).filter(Boolean))) {
     if (G.seenMods[m]) continue;
     G.seenMods[m] = true;
     news.push(`New enemy: ${MODS[m].name}. ${MODS[m].desc}`);
   }
-  if (news.length) toast(news.join('  ·  '));
+  if (news.length && !quiet) toast(news.join('  ·  '));
   newText();
   setTextState();
   renderShop();
@@ -1276,22 +1386,103 @@ function beginWave(bane) {
 }
 
 function hostEndWave() {
-  toGuests({ t: 'waveEnd' });
-  onWaveEnd();
+  const focus = isFocusWave(G.wave + 1) ? pickFocus() : null;
+  toGuests({ t: 'waveEnd', focus });
+  onWaveEnd(focus);
 }
 
-function onWaveEnd() {
+function onWaveEnd(nextFocus = null) {
+  const clearedBoss = isBossWave(G.wave);
   G.bane = null;
+  G.focus = nextFocus;
   setBaneWords(null);
+  setFocusWords(null);
   const bonus = waveBonus(G.wave);
   G.gold += bonus;
+  G.goldEarned += bonus;
   stats.pushHistory(wave.keys);
   toast(`Wave ${G.wave} cleared! +${bonus} bonus gold · ${wave.clean}/${wave.words} clean words · ${wave.gold} gold from typing`);
   best = Math.max(best, G.wave);
   try { localStorage.setItem(BEST_KEY, best); } catch { /* storage unavailable */ }
   G.wave++;
-  openDraft(1);
+  if (clearedBoss && myItems().size) openBridgePick();
+  else openDraft(1);
 }
+
+// ---------- boss reward: build a bridge
+
+function openBridgePick(fromBoss = true) {
+  G.phase = 'bridge';
+  G.bridgePick = { from: null, fromBoss };
+  setTextState();
+  renderBridgePick();
+  renderShop();
+  renderHud();
+}
+
+function bridgeChoose(code) {
+  if (G.phase !== 'bridge' || !isLetterCode(code)) return;
+  const B = G.bridgePick, mine = G.players[NET.me];
+  if (!B.from) {
+    if (mine.bridges.has(code)) return toast(`${keyLabel(code)} already has a bridge.`);
+    B.from = code;
+    kb.setSelected(code);
+  } else {
+    if (code === B.from) { B.from = null; kb.setSelected(null); }
+    else if (!myItems().has(code)) return toast(`${keyLabel(code)} has no tower. Pick one of your towers to link to.`);
+    else {
+      changeBridge(B.from, code);
+      toast(`Bridge built: typing ${keyLabel(B.from)} also fires your ${ITEMS[myItems().get(code).type].name} on ${keyLabel(code)}.`);
+      return finishBridgePick();
+    }
+  }
+  renderBridgePick();
+}
+
+function finishBridgePick() {
+  const fromBoss = G.bridgePick?.fromBoss !== false;
+  G.bridgePick = null;
+  kb.setSelected(selectedKey);
+  if (fromBoss) openDraft(1);
+  else openShop();
+}
+
+function renderBridgePick() {
+  const el = $('#draft');
+  el.hidden = false;
+  paintKeys();
+  const B = G.bridgePick, mine = G.players[NET.me];
+  const fromKey = B.from ? letterOf(B.from) : null;
+  const suggestions = LETTER_FREQUENCY.slice(0, 10).map(f => charToCode(f.letter)).filter(c => !mine.bridges.has(c));
+  const towers = [...myItems()].filter(([c]) => c !== B.from);
+  const preview = (to, it) => {
+    const d = ITEMS[it.type], pm = keyPowerMult(fromKey) * BRIDGE_POWER;
+    return it.type === 'mine' ? `+${(d.gold * it.level * pm).toFixed(1)} gold` : d.support ? 'pulse' : `${Math.round(d.dmg * POWER[it.level] * pm)} dmg`;
+  };
+  el.innerHTML = `<div class="dtitle">Boss defeated! Reward: build a bridge
+      <span class="dstep">${B.from ? `Now type one of your towers' keys to link ${keyLabel(B.from)} to` : 'Type the key to link FROM (it doesn\'t need a tower)'}</span></div>
+    <p class="bridgehelp">Whenever you type the first key, the linked tower fires too, at ${Math.round(BRIDGE_POWER * 100)}% power with the first key's strength.
+      Common letters make the best triggers: they fire the bridge most often.</p>
+    <div class="bridgerow">${B.from
+      ? `<span class="bfrom">${keyLabel(B.from)} <small>${FREQ_BY_LETTER[fromKey].pctLetters}% of letters</small></span><span class="barrow">→</span>
+         <div class="bchips">${towers.map(([c, it]) => `<button class="bchip" data-bkey="${c}" style="--c:${hex(ITEMS[it.type].color)}"><b>${keyLabel(c)}</b> ${ITEMS[it.type].name} <small>${preview(c, it)}/press</small></button>`).join('')}</div>`
+      : `<div class="bchips">${suggestions.map(c => `<button class="bchip" data-bkey="${c}"><b>${keyLabel(c)}</b> <small>${FREQ_BY_LETTER[letterOf(c)].pctLetters}%</small></button>`).join('')}<span class="muted" style="align-self:center">…or type any letter</span></div>`}
+    </div>
+    ${mine.bridges.size ? `<p class="bridgehelp">Your bridges: ${[...mine.bridges].map(([f, b]) => `${keyLabel(f)} → ${keyLabel(b.to)}`).join(' · ')}</p>` : ''}
+    <div class="dfoot">${B.from ? '<button id="bridgeBack">← Change first key <kbd>Backspace</kbd></button>' : ''}<button id="bridgeSkip">Skip (+${SKIP_GOLD}g) <kbd>Esc</kbd></button></div>`;
+}
+
+$('#draft').addEventListener('click', e => {
+  if (G.phase !== 'bridge') return;
+  const chip = e.target.closest('[data-bkey]');
+  if (chip) bridgeChoose(chip.dataset.bkey);
+  else if (e.target.closest('#bridgeBack')) { G.bridgePick.from = null; kb.setSelected(null); renderBridgePick(); }
+  else if (e.target.closest('#bridgeSkip')) {
+    G.gold += SKIP_GOLD;
+    G.goldEarned += SKIP_GOLD;
+    finishBridgePick();
+  }
+});
 
 function hostGameOver() {
   toGuests({ t: 'over' });
@@ -1327,7 +1518,11 @@ function playAgain() {
 
 // Remove everything from the previous run (towers, enemies) before laying out a new one.
 function clearRun() {
-  G.players.forEach((p, pid) => { for (const code of [...p.items.keys()]) setItem(pid, code, null, 0); });
+  G.players.forEach((p, pid) => {
+    for (const from of [...p.bridges.keys()]) setBridge(pid, from, null);
+    for (const code of [...p.items.keys()]) setItem(pid, code, null, 0);
+  });
+  setFocusWords(null);
   enemies.forEach(removeEnemy);
   enemies = [];
   spawnQueue = [];
@@ -1336,7 +1531,7 @@ function clearRun() {
 
 function startGame(players) {
   clearRun();
-  NET.me = Math.max(0, players.findIndex(p => p.id === myPeerId()));
+  NET.me = Math.max(0, players.findIndex(p => p.id === CLIENT_ID));
   G = newGame(players);
   nextEnemyId = 1;
   NET.started = true;
@@ -1357,60 +1552,63 @@ function startGame(players) {
   openDraft(OPENING_PICKS);
 }
 
-// ---------- game-long stats: DPS, gold and WPM for every player, one sample per second
+// ---------- game stats: running totals for every player, sampled once per second of WAVE time
+// (the shop and draft between waves don't count).
 
-const STAT_KEYS = ['dps', 'gold', 'wpm'];
-let timeline = [];   // [{ wave: bool, p: [[dps, gold, wpm], ...] }]
-let dmgAcc = [];     // damage dealt this second, per player (host/solo)
-let dmgWindow = [];  // per player: damage in each of the last 5 seconds
-let typeTimes = [];  // timestamps of my correct keystrokes in the last 10 seconds
-let reported = [];   // host: latest { gold, wpm } reported by each guest
+const STAT_LABELS = ['Damage', 'Gold earned', 'Avg WPM'];
+let timeline = [];  // [{ wave, p: [[totalDamage, goldEarned, avgWpm], ...] }]
+let dmgTotal = [];  // host/solo: total damage dealt by each player's towers
+let reported = [];  // host: latest { gold, wpm } reported by each guest
 let statTimer = 0;
 
 function resetStats() {
   timeline = [];
-  dmgAcc = [];
-  dmgWindow = G.players.map(() => []);
-  typeTimes = [];
+  dmgTotal = [];
   reported = [];
   statTimer = 0;
   renderStats();
 }
 
-function myWpm() {
-  const now = performance.now();
-  while (typeTimes.length && now - typeTimes[0] > 10000) typeTimes.shift();
-  return Math.round(typeTimes.length * 1.2); // chars in 10 s -> words per minute (5 chars per word)
-}
+// Your average typing speed over all the wave time so far.
+const myAvgWpm = () => (G.waveSecs > 1 ? Math.round(G.waveChars / 5 / (G.waveSecs / 60)) : 0);
 
-// Runs from the simulation timer, so it keeps sampling between rounds and in background tabs.
+// Runs from the simulation timer, so it keeps going in background tabs.
+let lonelyTimer = 0;
 function statsTick(dt) {
   if (G.phase === 'lobby') return;
+  const inWave = G.phase === 'wave';
+  if (inWave) G.waveSecs += dt;
   statTimer += dt;
   if (statTimer < 1) return;
   statTimer -= 1;
+  saveRun();
+  // a host left alone in a multiplayer game checks whether the room moved to a new host
+  if (NET.role === 'host' && NET.started && G.players.length > 1 && onlineGuests() === 0 && ++lonelyTimer >= 8) {
+    lonelyTimer = 0;
+    checkSuperseded();
+  }
   if (NET.role === 'guest') {
-    toHost({ t: 'stat', gold: goldNow(), wpm: myWpm() });
+    toHost({ t: 'stat', gold: Math.floor(G.goldEarned), wpm: myAvgWpm() });
     return; // the host sends everyone's sample back
   }
+  if (!inWave) return; // the clock and charts only run during waves
   const sample = G.players.map((p, pid) => {
-    const w = (dmgWindow[pid] ??= []);
-    w.push(dmgAcc[pid] || 0);
-    if (w.length > 5) w.shift();
-    const dps = Math.round(w.reduce((a, b) => a + b, 0) / w.length);
-    if (pid === NET.me) return [dps, goldNow(), myWpm()];
+    const dmg = Math.round(dmgTotal[pid] || 0);
+    if (pid === NET.me) return [dmg, Math.floor(G.goldEarned), myAvgWpm()];
     const r = reported[pid] ?? { gold: 0, wpm: 0 };
-    return [dps, p.online ? r.gold : 0, p.online ? r.wpm : 0];
+    return [dmg, r.gold, r.wpm];
   });
-  dmgAcc = [];
-  pushSample({ wave: G.phase === 'wave', p: sample });
-  toGuests({ t: 'stats', wave: G.phase === 'wave', p: sample });
+  pushSample({ wave: G.wave, p: sample });
+  toGuests({ t: 'stats', wave: G.wave, p: sample });
 }
 
 function pushSample(sample) {
   timeline.push(sample);
   renderStats();
+  renderShop(); // keeps tower shot/damage counts current during the wave
 }
+
+const fmtNum = n => (n >= 10000 ? `${(n / 1000).toFixed(1)}k` : n.toLocaleString());
 
 function drawChart(cv, k) {
   const W = cv.clientWidth, H = cv.clientHeight, dpr = devicePixelRatio || 1;
@@ -1423,15 +1621,15 @@ function drawChart(cv, k) {
   if (n < 2) return;
   const max = Math.max(10, ...timeline.flatMap(s => s.p.map(v => v[k]))) * 1.1;
   const X = i => (i / (n - 1)) * W, Y = v => H - 2 - (v / max) * (H - 4);
-  // shade the wave periods
-  g.fillStyle = 'rgba(255,107,91,0.10)';
-  let start = null;
+  // a thin line where each new wave starts
+  g.strokeStyle = 'rgba(255,255,255,0.12)';
+  g.lineWidth = 1;
   timeline.forEach((s, i) => {
-    if (s.wave && start == null) start = i;
-    if ((!s.wave || i === n - 1) && start != null) {
-      g.fillRect(X(start), 0, X(i) - X(start), H);
-      start = null;
-    }
+    if (!i || s.wave === timeline[i - 1].wave) return;
+    g.beginPath();
+    g.moveTo(Math.round(X(i)) + 0.5, 0);
+    g.lineTo(Math.round(X(i)) + 0.5, H);
+    g.stroke();
   });
   G.players.forEach((p, pid) => {
     g.strokeStyle = PLAYER_COLORS[pid];
@@ -1453,23 +1651,28 @@ function renderStats() {
   el.hidden = G.phase === 'lobby';
   if (el.hidden) return;
   const last = timeline.at(-1)?.p ?? [];
-  const mins = Math.floor(timeline.length / 60), secs = String(timeline.length % 60).padStart(2, '0');
+  const secs = timeline.length; // seconds of wave time
+  const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
   const multi = G.players.length > 1;
   if (!el.dataset.built) {
-    el.innerHTML = `<div class="sp-head"><span>Game stats</span><span class="sp-time"></span><button class="sp-toggle" title="Show or hide the charts">–</button></div>
-      <div class="sp-body">${STAT_KEYS.map((k, i) => `<div class="sp-row"><div class="sp-label">${['DPS', 'Gold', 'WPM'][i]}<span class="sp-vals" data-k="${i}"></span></div><canvas class="sp-chart" data-k="${i}"></canvas></div>`).join('')}
+    el.innerHTML = `<div class="sp-head"><span>Game totals</span><span class="sp-time" title="Time spent in waves (shop and draft time doesn't count)"></span><button class="sp-toggle" title="Show or hide the charts">–</button></div>
+      <div class="sp-body">${STAT_LABELS.map((label, i) => `<div class="sp-row"><div class="sp-label">${label}<span class="sp-vals" data-k="${i}"></span></div><canvas class="sp-chart" data-k="${i}"></canvas></div>`).join('')}
       <div class="sp-legend"></div></div>`;
     el.dataset.built = '1';
   }
-  el.querySelector('.sp-time').textContent = `${mins}:${secs}`;
-  STAT_KEYS.forEach((_, i) => {
-    el.querySelector(`.sp-vals[data-k="${i}"]`).innerHTML = G.players.map((p, pid) =>
-      `<b style="color:${PLAYER_COLORS[pid]}">${last[pid]?.[i] ?? 0}</b>`).join(multi ? ' · ' : '');
+  el.querySelector('.sp-time').textContent = `wave time ${clock}${G.phase !== 'wave' ? ' · paused' : ''}`;
+  STAT_LABELS.forEach((_, i) => {
+    el.querySelector(`.sp-vals[data-k="${i}"]`).innerHTML = G.players.map((p, pid) => {
+      // your own gold and WPM are shown live; damage (and other players) come from the samples
+      const v = pid === NET.me && i === 1 ? Math.floor(G.goldEarned) : pid === NET.me && i === 2 ? myAvgWpm() : last[pid]?.[i] ?? 0;
+      const extra = i === 0 && secs ? ` <small>${Math.round(v / secs)}/s</small>` : '';
+      return `<b style="color:${PLAYER_COLORS[pid]}">${fmtNum(v)}${extra}</b>`;
+    }).join(multi ? ' · ' : '');
     if (!el.classList.contains('collapsed')) drawChart(el.querySelector(`.sp-chart[data-k="${i}"]`), i);
   });
-  el.querySelector('.sp-legend').innerHTML = multi
-    ? G.players.map((p, pid) => `<span><i style="background:${PLAYER_COLORS[pid]}"></i>${esc(p.name)}${pid === NET.me ? ' (you)' : ''}</span>`).join('') + '<span><i class="wavebox"></i>wave</span>'
-    : '<span><i class="wavebox"></i>shaded = wave in progress</span>';
+  el.querySelector('.sp-legend').innerHTML = (multi
+    ? G.players.map((p, pid) => `<span><i style="background:${PLAYER_COLORS[pid]}"></i>${esc(p.name)}${pid === NET.me ? ' (you)' : ''}</span>`).join('')
+    : '') + '<span class="muted">Counts only during waves</span>';
 }
 $('#statsPanel').addEventListener('click', e => {
   if (!e.target.closest('.sp-toggle')) return;
@@ -1481,7 +1684,16 @@ $('#statsPanel').addEventListener('click', e => {
 
 // ---------- lobby and networking
 
-const myPeerId = () => (NET.role === 'guest' ? NET.room?.peer?.id : 'host');
+// A stable id for this browser tab (survives reloads), so a player who drops out or refreshes
+// gets their seat, towers and gold back when they rejoin.
+const CLIENT_ID = (() => {
+  try {
+    let id = sessionStorage.getItem('keydefense.cid');
+    if (!id) sessionStorage.setItem('keydefense.cid', (id = Math.random().toString(36).slice(2, 10)));
+    return id;
+  } catch { return Math.random().toString(36).slice(2, 10); }
+})();
+const RUN_KEY = 'keydefense.run';
 let myName = 'Player';
 try { myName = localStorage.getItem(NAME_KEY) || myName; } catch { /* storage unavailable */ }
 
@@ -1491,8 +1703,34 @@ function readName() {
   try { localStorage.setItem(NAME_KEY, myName); } catch { /* storage unavailable */ }
 }
 
+// Your own gold and run stats, kept in this tab so a reload can pick up where you were.
+function saveRun() {
+  if (!isMulti() || !NET.started || !NET.room) return;
+  try {
+    sessionStorage.setItem(RUN_KEY, JSON.stringify({
+      code: NET.room.code, gold: G.gold, totals: G.totals, keyTimes: G.keyTimes, streak: G.streak, seenMods: G.seenMods,
+      goldEarned: G.goldEarned, waveChars: G.waveChars, waveSecs: G.waveSecs,
+    }));
+  } catch { /* storage unavailable */ }
+}
+function loadRun(code) {
+  try {
+    const r = JSON.parse(sessionStorage.getItem(RUN_KEY));
+    return r?.code === code ? r : null;
+  } catch { return null; }
+}
+const setRoomUrl = code => history.replaceState(null, '', `${location.pathname}?room=${code}`);
+
+function showBanner(text, withLeave = false) {
+  const b = $('#netBanner');
+  b.innerHTML = `<span>${esc(text)}</span>${withLeave ? ' <button id="bannerLeave">Back to menu</button>' : ''}`;
+  b.hidden = false;
+  $('#bannerLeave')?.addEventListener('click', leaveRoom);
+}
+const hideBanner = () => { $('#netBanner').hidden = true; };
+
 function lobbyPlayersHTML(list) {
-  return `<ul class="plist">${list.map((p, i) => `<li><span class="pdot" style="background:${PLAYER_COLORS[i]}"></span>${esc(p.name)}${p.id === myPeerId() ? ' <span class="muted">(you)</span>' : ''}${i === 0 ? ' <span class="muted">· host</span>' : ''}</li>`).join('')}
+  return `<ul class="plist">${list.map((p, i) => `<li><span class="pdot" style="background:${PLAYER_COLORS[i]}"></span>${esc(p.name)}${p.id === CLIENT_ID ? ' <span class="muted">(you)</span>' : ''}${p.id === NET.hostId ? ' <span class="muted">· host</span>' : ''}</li>`).join('')}
     ${Array.from({ length: MAX_PLAYERS - list.length }, () => '<li class="empty">open slot</li>').join('')}</ul>`;
 }
 
@@ -1525,7 +1763,7 @@ function renderLobby(screen = 'menu', info = '') {
       <button class="lbtn ghostbtn" id="cancelBtn">Leave</button>
       <p class="lmsg">${info}</p>`;
   } else {
-    html = `<h2>${info}</h2><p class="lmsg"></p>`;
+    html = `<h2>${esc(info)}</h2><button class="lbtn ghostbtn" id="cancelBtn">Cancel</button><p class="lmsg"></p>`;
   }
   el.innerHTML = `<div class="box lobbybox">${html}</div>`;
   if (screen === 'menu' && roomCode) $('#codeInput').focus();
@@ -1542,16 +1780,17 @@ $('#lobby').addEventListener('click', async e => {
   if (id === 'soloBtn') {
     readName();
     NET.role = 'solo';
-    startGame([{ name: myName, id: 'host' }]);
+    history.replaceState(null, '', location.pathname + location.search.replace(/[?&]room=[^&]*/, ''));
+    startGame([{ name: myName, id: CLIENT_ID }]);
     applyDevParams();
   } else if (id === 'hostBtn') {
     readName();
     lobbyMsg('Creating a room…');
     try {
       NET.room = new Room(roomHandlers());
-      await NET.room.host();
-      NET.role = 'host';
-      NET.lobby = [{ name: myName, id: 'host' }];
+      const code = await NET.room.host();
+      Object.assign(NET, { role: 'host', epoch: 0, hostId: CLIENT_ID, peers: new Map(), lobby: [{ name: myName, id: CLIENT_ID }] });
+      setRoomUrl(code);
       renderLobby('hosting');
     } catch (err) {
       NET.room?.close();
@@ -1563,16 +1802,8 @@ $('#lobby').addEventListener('click', async e => {
     const code = $('#codeInput').value.trim().toUpperCase();
     if (code.length !== 4) return lobbyMsg('Enter the 4-letter room code.');
     lobbyMsg(`Joining ${code}…`);
-    try {
-      NET.room = new Room(roomHandlers());
-      await NET.room.join(code);
-      NET.role = 'guest';
-      toHost({ t: 'hello', name: myName });
-    } catch (err) {
-      NET.room?.close();
-      NET.room = null;
-      lobbyMsg(err.message || String(err));
-    }
+    const err = await joinRoom(code);
+    if (err) lobbyMsg(err);
   } else if (id === 'copyBtn') {
     $('#linkInput').select();
     try { await navigator.clipboard.writeText($('#linkInput').value); lobbyMsg('Link copied.'); } catch { lobbyMsg('Select the link and copy it.'); }
@@ -1584,15 +1815,34 @@ $('#lobby').addEventListener('click', async e => {
   }
 });
 
+// Connects to the newest host of a room. Returns an error message, or null on success.
+async function joinRoom(code) {
+  NET.room?.close();
+  NET.room = new Room(roomHandlers());
+  try {
+    NET.epoch = await NET.room.join(code);
+    NET.role = 'guest';
+    lastHostMsg = performance.now();
+    setRoomUrl(code);
+    toHost({ t: 'hello', name: myName, cid: CLIENT_ID });
+    return null;
+  } catch (err) {
+    NET.room?.close();
+    NET.room = null;
+    NET.role = 'solo';
+    return err.message || String(err);
+  }
+}
+
 function leaveRoom() {
   NET.room?.close();
-  NET.room = null;
-  NET.role = 'solo';
-  NET.started = false;
-  NET.lobby = [];
+  Object.assign(NET, { room: null, role: 'solo', started: false, lobby: [], epoch: 0, hostId: null, peers: new Map() });
+  recovering = false;
+  hideBanner();
+  try { sessionStorage.removeItem(RUN_KEY); } catch { /* storage unavailable */ }
   history.replaceState(null, '', location.pathname);
   clearRun();
-  G = newGame([{ name: myName, id: 'host' }]);
+  G = newGame([{ name: myName, id: CLIENT_ID }]);
   G.phase = 'lobby';
   NET.me = 0;
   setLanePlayers(1);
@@ -1608,46 +1858,129 @@ function leaveRoom() {
   renderLobby('menu');
 }
 
-const pidOf = peerId => G.players.findIndex(p => p.id === peerId);
+const pidOfPeer = peerId => G.players.findIndex(p => p.id === NET.peers.get(peerId));
+
+// ---- heartbeat: a closed tab can take 30 s+ for WebRTC to notice, so everyone pings once a
+// second and silence is treated as a lost connection.
+const HOST_TIMEOUT = 4500, GUEST_TIMEOUT = 6000;
+let hbTimer = 0;
+const lastSeen = new Map(); // host: guest peer id -> last message time
+let lastHostMsg = 0;        // guest: last message from the host
+
+function heartbeat(dt) {
+  if (!NET.room || NET.role === 'solo') return;
+  hbTimer += dt;
+  if (hbTimer < 1) return;
+  hbTimer = 0;
+  const now = performance.now();
+  if (NET.role === 'host') {
+    toGuests({ t: 'ping' });
+    for (const [peer, seen] of lastSeen) {
+      if (now - seen < GUEST_TIMEOUT) continue;
+      lastSeen.delete(peer);
+      dropPeer(peer);
+    }
+  } else if (!recovering && NET.room.hostConn) {
+    toHost({ t: 'ping' });
+    if (now - lastHostMsg > HOST_TIMEOUT) {
+      const conn = NET.room.hostConn;
+      NET.room.hostConn = null;
+      conn.close();
+      startRecovery();
+    }
+  }
+}
+
+// Host: a guest's connection closed or went silent.
+function dropPeer(peerId) {
+  const cid = NET.peers.get(peerId);
+  NET.peers.delete(peerId);
+  NET.room?.conns.get(peerId)?.close();
+  NET.room?.conns.delete(peerId);
+  if (!cid || [...NET.peers.values()].includes(cid)) return; // unknown, or already reconnected
+  if (!NET.started) {
+    NET.lobby = NET.lobby.filter(p => p.id !== cid);
+    toGuests({ t: 'lobby', players: NET.lobby, hostId: NET.hostId });
+    renderLobby('hosting');
+    return;
+  }
+  const pid = G.players.findIndex(p => p.id === cid);
+  if (pid < 0 || !G.players[pid].online) return;
+  G.players[pid].online = false;
+  toast(`${G.players[pid].name} disconnected. They can rejoin with the room link.`);
+  toGuests({ t: 'left', pid });
+  if (G.phase !== 'wave' && G.phase !== 'over') hostCheckReady();
+  renderShop();
+}
+const onlineGuests = () => G.players.filter((p, pid) => pid !== NET.me && p.online).length;
 
 function roomHandlers() {
   return {
-    canJoin: () => (NET.started ? 'That game has already started.' : NET.lobby.length >= MAX_PLAYERS ? 'That room is full.' : null),
-    onMessage: (msg, from) => (NET.role === 'host' ? hostMessage(msg, from) : guestMessage(msg)),
-    onLeave: peerId => {
-      if (!NET.started) {
-        NET.lobby = NET.lobby.filter(p => p.id !== peerId);
-        toGuests({ t: 'lobby', players: NET.lobby });
-        renderLobby('hosting');
-        return;
+    onMessage: (msg, from) => {
+      if (NET.role === 'host') {
+        lastSeen.set(from, performance.now());
+        if (msg.t !== 'ping') hostMessage(msg, from);
+      } else {
+        lastHostMsg = performance.now();
+        if (msg.t !== 'ping') guestMessage(msg);
       }
-      const pid = pidOf(peerId);
-      if (pid < 0) return;
-      G.players[pid].online = false;
-      toast(`${G.players[pid].name} left the game.`);
-      toGuests({ t: 'left', pid });
-      hostCheckReady();
     },
-    onHostLeft: () => {
-      $('#centerMsg').innerHTML = '<div class="box"><h2>The host left the game</h2><button id="leaveBtn">Back to menu</button></div>';
-      $('#centerMsg').hidden = false;
-      $('#leaveBtn').addEventListener('click', leaveRoom);
-      G.phase = 'over';
-      setTextState();
+    onLeave: peerId => {
+      lastSeen.delete(peerId);
+      dropPeer(peerId);
     },
+    onHostLeft: () => startRecovery(),
+    onSignal: online => { if (online && NET.role === 'host') checkSuperseded(); },
     onError: err => toast(`Connection problem: ${err.message || err.type}`),
   };
 }
 
-function hostMessage(msg, from) {
-  if (msg.t === 'hello') {
-    if (NET.started || NET.lobby.length >= MAX_PLAYERS) return;
-    NET.lobby.push({ name: String(msg.name || 'Player').slice(0, 16), id: from });
-    toGuests({ t: 'lobby', players: NET.lobby });
+// ---- host side
+
+function hostSync() {
+  return {
+    t: 'sync', epoch: NET.epoch, hostId: NET.hostId, started: NET.started, lobby: NET.lobby,
+    players: G.players.map(p => ({
+      name: p.name, id: p.id, online: p.online, ready: p.ready,
+      items: [...p.items].map(([c, it]) => [c, it.type, it.level]),
+      bridges: [...p.bridges].map(([f, b]) => [f, b.to]),
+    })),
+    wave: G.wave, lives: G.lives, inWave: G.phase === 'wave', over: G.phase === 'over', bane: G.bane, focus: G.focus,
+    enemies: enemies.filter(e => !e.dead).map(e => ({
+      id: e.id, type: e.type, hp: e.hp, maxHp: e.maxHp, mod: e.mod, lock: e.lock,
+      bane: e.bane ? { kind: e.bane.kind, letters: e.bane.letters } : null, dist: e.dist, haste: e.haste, shield: e.shield,
+    })),
+    queue: spawnQueue, interval: spawnInterval, nextId: nextEnemyId,
+  };
+}
+
+function handleHello(msg, from) {
+  const cid = String(msg.cid || from), name = String(msg.name || 'Player').slice(0, 16);
+  const reject = reason => NET.room.sendTo(from, { t: 'reject', reason });
+  if (!NET.started) {
+    if (!NET.lobby.some(p => p.id === cid)) {
+      if (NET.lobby.length >= MAX_PLAYERS) return reject('That room is full.');
+      NET.lobby.push({ name, id: cid });
+    }
+    NET.peers.set(from, cid);
+    toGuests({ t: 'lobby', players: NET.lobby, hostId: NET.hostId });
     renderLobby('hosting');
     return;
   }
-  const pid = pidOf(from);
+  const pid = G.players.findIndex(p => p.id === cid);
+  if (pid < 0) return reject('That game has already started.');
+  for (const [peer, c] of NET.peers) if (c === cid) NET.peers.delete(peer); // drop a stale connection
+  NET.peers.set(from, cid);
+  G.players[pid].online = true;
+  NET.room.sendTo(from, hostSync());
+  toGuests({ t: 'back', pid }, from);
+  toast(`${G.players[pid].name} is back.`);
+  renderShop();
+}
+
+function hostMessage(msg, from) {
+  if (msg.t === 'hello') return handleHello(msg, from);
+  const pid = pidOfPeer(from);
   if (pid < 0) return;
   switch (msg.t) {
     case 'key':
@@ -1665,6 +1998,10 @@ function hostMessage(msg, from) {
       setItem(pid, msg.code, msg.type, msg.level);
       toGuests({ t: 'item', pid, code: msg.code, type: msg.type, level: msg.level }, from);
       break;
+    case 'bridge':
+      setBridge(pid, msg.from, msg.to);
+      toGuests({ t: 'bridge', pid, from: msg.from, to: msg.to }, from);
+      break;
     case 'stat':
       reported[pid] = { gold: msg.gold, wpm: msg.wpm };
       break;
@@ -1675,16 +2012,204 @@ function hostMessage(msg, from) {
   }
 }
 
+// A host that lost its network may come back to find the others moved on to a new host.
+// If nobody is connected any more and a newer epoch of the room exists, join it as a guest.
+let checkingSuperseded = false;
+async function checkSuperseded() {
+  if (checkingSuperseded || NET.role !== 'host' || !NET.room || G.players.length < 2 || onlineGuests() > 0) return;
+  checkingSuperseded = true;
+  try {
+    const newer = await NET.room.findNewer();
+    if (newer != null && NET.role === 'host' && onlineGuests() === 0) {
+      showBanner('You lost connection and another player took over hosting. Rejoining…');
+      const err = await joinRoom(NET.room.code);
+      if (err) showBanner(`Couldn't rejoin: ${err}`, true);
+    }
+  } finally {
+    checkingSuperseded = false;
+  }
+}
+
+// ---- guest side
+
+function applySync(msg) {
+  NET.epoch = msg.epoch;
+  NET.hostId = msg.hostId;
+  NET.lobby = msg.lobby ?? NET.lobby;
+  if (!msg.started) {
+    renderLobby('joined');
+    return;
+  }
+  const same = NET.started && G.players.length === msg.players.length && G.players.every((p, i) => p.id === msg.players[i].id);
+  const wasInWave = G.phase === 'wave';
+  if (!same) {
+    // (re)joining this game from scratch, e.g. after a reload: rebuild the board around our seat
+    clearRun();
+    NET.me = Math.max(0, msg.players.findIndex(p => p.id === CLIENT_ID));
+    G = newGame(msg.players);
+    NET.started = true;
+    const run = loadRun(NET.room.code);
+    if (run) {
+      Object.assign(G, {
+        gold: run.gold, totals: run.totals, keyTimes: run.keyTimes, streak: run.streak, seenMods: run.seenMods ?? {},
+        goldEarned: run.goldEarned ?? 0, waveChars: run.waveChars ?? 0, waveSecs: run.waveSecs ?? 0,
+      });
+    }
+    setLanePlayers(msg.players.length);
+    buildLane();
+    makeBoards(msg.players.length);
+    userMoved = false;
+    fitView();
+    renderViewBtn();
+    $('#lobby').hidden = true;
+    $('#centerMsg').hidden = true;
+    $('#statsPanel').dataset.built = '';
+    resetStats();
+    newText();
+  }
+  msg.players.forEach((p, pid) => {
+    const P = G.players[pid];
+    Object.assign(P, { name: p.name, online: p.online, ready: p.ready });
+    const want = new Map(p.items.map(([c, t, l]) => [c, [t, l]]));
+    for (const c of [...P.items.keys()]) if (!want.has(c)) setItem(pid, c, null, 0);
+    for (const [c, [t, l]] of want) {
+      const cur = P.items.get(c);
+      if (!cur || cur.type !== t || cur.level !== l) setItem(pid, c, t, l);
+    }
+    const wantBridges = new Map(p.bridges ?? []);
+    for (const f of [...P.bridges.keys()]) if (!wantBridges.has(f)) setBridge(pid, f, null);
+    for (const [f, to] of wantBridges) if (P.bridges.get(f)?.to !== to) setBridge(pid, f, to);
+  });
+  G.lives = msg.lives;
+  G.focus = msg.focus ?? null;
+  for (const e of [...enemies]) removeEnemy(e);
+  enemies = [];
+  for (const spec of msg.enemies) {
+    const e = spawnEnemy(spec);
+    Object.assign(e, { maxHp: spec.maxHp, dist: spec.dist, haste: spec.haste, shield: spec.shield });
+  }
+  spawnQueue = msg.queue ?? [];
+  spawnInterval = msg.interval ?? 1;
+  nextEnemyId = msg.nextId ?? nextEnemyId;
+  if (msg.over) {
+    G.wave = msg.wave;
+    showGameOver();
+  } else if (msg.inWave) {
+    G.wave = msg.wave;
+    if (!wasInWave || !same) beginWave(msg.bane, true);
+    else G.bane = msg.bane;
+  } else if (wasInWave && same) {
+    G.wave = msg.wave - 1; // the wave finished while we were away
+    onWaveEnd();
+  } else {
+    G.wave = msg.wave;
+    if (!same) openShop(); // rejoined between waves: your towers came back with you
+  }
+  setTextState();
+  renderShop();
+  renderHud();
+}
+
+// Lost the host: wait briefly in case it comes back, then hand hosting to the next player.
+let recovering = false;
+async function startRecovery() {
+  if (recovering || !NET.room) return;
+  recovering = true;
+  const lostHost = NET.hostId, code = NET.room.code;
+  showBanner('Lost connection to the host. Reconnecting…');
+  const graceEnd = performance.now() + 5000; // a short blip: the same host comes back
+  while (NET.room && performance.now() < graceEnd) {
+    if (await NET.room.connectTo(NET.epoch, 2000)) return rejoined();
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  if (!NET.room) return;
+  // Everyone still here agrees on the order (seat order), so they all pick the same new host.
+  const roster = NET.started
+    ? G.players.map(p => ({ id: p.id, name: p.name, online: p.online }))
+    : NET.lobby.map(p => ({ id: p.id, name: p.name, online: true }));
+  const order = roster.filter(r => r.online && r.id !== lostHost);
+  for (let i = 0; i < order.length && NET.room; i++) {
+    const epoch = NET.epoch + 1 + i;
+    if (order[i].id === CLIENT_ID) {
+      await becomeHost(code, epoch, lostHost);
+      recovering = false;
+      return;
+    }
+    showBanner(`The host left. ${order[i].name} is taking over…`);
+    // They may not have opened the new room yet ("no such room" comes back instantly), so keep
+    // trying for the whole window before moving on to the next player in line.
+    const deadline = performance.now() + 12000;
+    while (NET.room && performance.now() < deadline) {
+      if (await NET.room.connectTo(epoch, 2500)) return rejoined();
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  recovering = false;
+  showBanner("Couldn't reconnect to the room.", true);
+}
+
+function rejoined() {
+  recovering = false;
+  lastHostMsg = performance.now();
+  toHost({ t: 'hello', name: myName, cid: CLIENT_ID });
+  showBanner('Reconnected!');
+  setTimeout(hideBanner, 1500);
+}
+
+async function becomeHost(code, epoch, lostHost) {
+  showBanner('The host left. Taking over hosting…');
+  try {
+    NET.room.close();
+    NET.room = new Room(roomHandlers());
+    await NET.room.host(code, epoch);
+  } catch (err) {
+    showBanner(`Couldn't take over hosting: ${err.message || err.type}`, true);
+    return;
+  }
+  Object.assign(NET, { role: 'host', epoch, hostId: CLIENT_ID, peers: new Map() });
+  lastSeen.clear();
+  if (NET.started) {
+    const old = G.players.findIndex(p => p.id === lostHost);
+    if (old >= 0) G.players[old].online = false;
+    // Give everyone else a moment to reconnect before treating them as gone.
+    setTimeout(() => {
+      if (NET.role !== 'host') return;
+      const connected = new Set(NET.peers.values());
+      G.players.forEach((p, pid) => {
+        if (pid !== NET.me && p.online && !connected.has(p.id)) {
+          p.online = false;
+          toGuests({ t: 'left', pid });
+        }
+      });
+      if (G.phase !== 'wave' && G.phase !== 'over') hostCheckReady();
+      renderShop();
+    }, 20000);
+    toast("The host left, so you're hosting now. The game carries on.");
+  } else {
+    NET.lobby = NET.lobby.filter(p => p.id !== lostHost);
+    renderLobby('hosting', "The host left, so you're hosting now.");
+  }
+  setTimeout(hideBanner, 2500);
+  showBanner("You're the host now.");
+  renderShop();
+  renderHud();
+}
+
 function guestMessage(msg) {
   switch (msg.t) {
     case 'reject':
       lobbyMsg(msg.reason);
+      showBanner(msg.reason, true);
       NET.room?.close();
       NET.room = null;
       NET.role = 'solo';
       break;
+    case 'sync':
+      applySync(msg);
+      break;
     case 'lobby':
       NET.lobby = msg.players;
+      NET.hostId = msg.hostId ?? NET.hostId;
       renderLobby('joined');
       break;
     case 'start':
@@ -1697,6 +2222,9 @@ function guestMessage(msg) {
     case 'item':
       setItem(msg.pid, msg.code, msg.type, msg.level);
       break;
+    case 'bridge':
+      setBridge(msg.pid, msg.from, msg.to);
+      break;
     case 'readyState':
       msg.ready.forEach((r, pid) => { if (G.players[pid]) G.players[pid].ready = r; });
       setTextState();
@@ -1705,10 +2233,16 @@ function guestMessage(msg) {
     case 'wave':
       G.wave = msg.wave;
       G.players.forEach(p => { p.ready = false; });
+      // keep a copy of the spawn list so we could carry the wave on if we become host
+      spawnQueue = msg.queue ?? [];
+      spawnInterval = msg.interval ?? 1;
+      G.focus = msg.focus ?? null;
       beginWave(msg.bane);
       break;
     case 'spawn':
       spawnEnemy(msg.spec);
+      spawnQueue.shift();
+      nextEnemyId = msg.spec.id + 1;
       break;
     case 'die': {
       const e = enemyById.get(msg.id);
@@ -1729,15 +2263,17 @@ function guestMessage(msg) {
     case 'waveEnd':
       for (const e of [...enemies]) removeEnemy(e);
       enemies = [];
-      onWaveEnd();
+      spawnQueue = [];
+      onWaveEnd(msg.focus ?? null);
       break;
     case 'over':
       showGameOver();
       break;
     case 'left':
+    case 'back':
       if (G.players[msg.pid]) {
-        G.players[msg.pid].online = false;
-        toast(`${G.players[msg.pid].name} left the game.`);
+        G.players[msg.pid].online = msg.t === 'back';
+        toast(`${G.players[msg.pid].name} ${msg.t === 'back' ? 'is back' : 'disconnected'}.`);
         renderShop();
       }
       break;
@@ -1779,7 +2315,7 @@ function renderShop() {
   if (isMulti()) {
     html += `<div class="card"><h3><span>Room ${NET.room?.code ?? ''}</span><span class="hint">${G.players.length} players</span></h3>
       <ul class="plist small">${G.players.map((p, pid) => `<li><span class="pdot" style="background:${PLAYER_COLORS[pid]}"></span>${esc(p.name)}${pid === NET.me ? ' <span class="muted">(you)</span>' : ''}
-        <span class="pstate">${!p.online ? 'left' : G.phase === 'wave' ? `${p.items.size} towers` : p.ready ? '✓ ready' : 'choosing…'}</span></li>`).join('')}</ul></div>`;
+        <span class="pstate">${!p.online ? 'disconnected' : p.id === NET.hostId ? (G.phase === 'wave' ? `host · ${p.items.size} towers` : p.ready ? 'host · ✓ ready' : 'host · choosing…') : G.phase === 'wave' ? `${p.items.size} towers` : p.ready ? '✓ ready' : 'choosing…'}</span></li>`).join('')}</ul></div>`;
   }
   html += `<div class="card"><h3><span>Your towers (${owned.length})</span><span class="hint">${status}</span></h3>`;
   html += owned.length ? `<div class="items">${owned.map(([code, it]) => {
@@ -1826,8 +2362,10 @@ function renderShop() {
     <p class="hint" style="margin-top:0">${G.phase === 'wave' ? 'This' : 'Next'} wave: ${Object.entries(next).map(([t, n]) => `${n} ${ENEMIES[t].name.toLowerCase()}${n > 1 ? 's' : ''}`).join(', ')}${
       Object.keys(mods).length ? ` <span class="modlist">(${Object.entries(mods).map(([m, n]) => `<span title="${MODS[m].desc}">${n} ${MODS[m].name.toLowerCase()}</span>`).join(', ')})</span>` : ''}${
       G.players.length > 1 ? ` <span class="muted">· scaled for ${G.players.length} players</span>` : ''}</p>
+    ${G.focus ? `<div class="focusnote"><b>Focus wave: ${FOCUSES[G.focus].name}</b> (${FOCUSES[G.focus].letters.toUpperCase().split('').join(' ')}). These letters come up much more often and towers on them deal +${Math.round(FOCUS_DAMAGE * 100)}% damage this wave. They're tinted teal on your keyboard.</div>` : ''}
+    ${G.players[NET.me].bridges.size ? `<div class="scout">Bridges: ${[...G.players[NET.me].bridges].map(([f, b]) => `<span class="chip">${keyLabel(f)}</span>→<span class="chip">${keyLabel(b.to)}</span>`).join(' ')}</div>` : ''}
     <div class="scout">${isBossWave(G.wave)
-      ? `<b class="bosswarn">Boss wave!</b> It gets a bane built from your slowest keys${slow.length ? `: <b>${slow.map(k => keyLabel(k.code)).join(' ')}</b>` : ''}.`
+      ? `<b class="bosswarn">Boss wave!</b> It gets a bane built from your slowest keys${slow.length ? `: <b>${slow.map(k => keyLabel(k.code)).join(' ')}</b>` : ''}. Beat it to earn a bridge.`
       : `<b>Boss in ${toBoss} wave${toBoss === 1 ? '' : 's'}.</b> Scouting your slowest keys: ${slow.length
         ? slow.map(k => `<span class="chip">${keyLabel(k.code)}</span> ${Math.round(k.ms)}ms`).join(' · ')
         : 'keep typing…'}`}</div>
@@ -1904,6 +2442,12 @@ window.addEventListener('keydown', e => {
     if (e.key === 'Enter' && NET.role !== 'guest') playAgain();
     return;
   }
+  if (G.phase === 'bridge') {
+    if (e.key === 'Escape') { G.gold += SKIP_GOLD; G.goldEarned += SKIP_GOLD; finishBridgePick(); }
+    else if (e.key === 'Backspace' && G.bridgePick.from) { G.bridgePick.from = null; kb.setSelected(null); renderBridgePick(); }
+    else if (isLetterCode(e.code)) bridgeChoose(e.code);
+    return;
+  }
   if (G.phase === 'draft') {
     if (/^[1-3]$/.test(e.key)) selectTower(Number(e.key) - 1);
     else if (G.draft.keys.includes(e.code)) selectKey(G.draft.keys.indexOf(e.code)); // type the key's letter
@@ -1954,6 +2498,7 @@ ticker.onmessage = () => {
 };
 
 function simStep(dt) {
+  heartbeat(dt);
   if (!paused) statsTick(dt);
   if (G.phase === 'wave' && !paused) {
     time += dt;
@@ -1984,14 +2529,19 @@ function loop(now) {
   updateFx(dt);
   animateClones(now);
   animateAuras(now);
+  animateBridges(now);
   if (G.phase === 'draft') art.render(now / 1000, i => i === hoverCard || i === G.draft?.tower);
 }
 
-// Developer shortcut for testing later waves (solo only): ?wave=10&gold=500
+// Developer shortcuts (solo only): ?wave=10&gold=500 starts later; ?bridge=1 opens the
+// boss-reward bridge right after the opening draft.
+let devBridge = false;
 function applyDevParams() {
   const params = new URLSearchParams(location.search);
+  devBridge = params.has('bridge');
   if (!params.has('wave') && !params.has('gold')) return;
   if (params.has('wave')) G.wave = Math.max(1, Number(params.get('wave')) || 1);
+  G.focus = isFocusWave(G.wave) ? pickFocus() : null;
   if (params.has('gold')) G.gold = Number(params.get('gold')) || 0;
   openDraft(OPENING_PICKS);
 }
@@ -2006,3 +2556,18 @@ renderHud();
 renderShop();
 renderLobby('menu');
 requestAnimationFrame(loop);
+
+// Reloaded in the middle of a multiplayer game? Rejoin automatically (the room may be moving to
+// a new host for a few seconds, so keep trying for a while).
+(async () => {
+  const code = (new URLSearchParams(location.search).get('room') || '').toUpperCase();
+  if (code.length !== 4 || !loadRun(code)) return;
+  renderLobby('msg', `Rejoining room ${code}…`);
+  for (let i = 0; i < 6; i++) {
+    const err = await joinRoom(code);
+    if (!err) return;
+    if (G.phase !== 'lobby' || $('#lobby').hidden) return;
+    await new Promise(r => setTimeout(r, 4000));
+  }
+  renderLobby('menu', `Couldn't rejoin room ${code}. It may have closed.`);
+})();

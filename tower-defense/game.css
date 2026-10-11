@@ -186,3 +186,34 @@ body.drafting .game-kb { height: clamp(260px, 42vh, 480px); }
 .sp-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 .sp-legend i.wavebox { background: rgba(255, 107, 91, 0.35); }
 @media (max-width: 600px) { .statspanel { width: 170px; } }
+
+/* ---------- connection banner */
+.netbanner {
+  position: absolute; left: 50%; top: 10px; transform: translateX(-50%); z-index: 5; max-width: calc(100% - 280px);
+  background: rgba(60, 46, 22, 0.95); border: 1px solid #ffd166; color: #ffe2a3; border-radius: 9px;
+  padding: 7px 14px; font-size: 13px; display: flex; gap: 10px; align-items: center;
+}
+.netbanner[hidden] { display: none; }
+.netbanner button { background: #4b6b4b; border: 1px solid #5f8a5f; border-radius: 6px; padding: 3px 10px; color: #fff; font-size: 12px; }
+@media (max-width: 700px) { .netbanner { max-width: calc(100% - 24px); top: auto; bottom: 10px; } }
+.sp-vals small { font-size: 10px; opacity: 0.75; }
+
+/* ---------- focus waves and bridges */
+.ch.focus { text-decoration: underline 2px rgba(94, 214, 196, 0.6); text-underline-offset: 4px; }
+.focusnote {
+  font-size: 12px; line-height: 1.5; color: #bfeee6; background: rgba(60, 160, 145, 0.15);
+  border: 1px solid rgba(94, 214, 196, 0.45); border-radius: 8px; padding: 6px 9px; margin: 6px 0 4px;
+}
+.bridgehelp { font-size: 12px; color: var(--muted); text-align: center; margin: 0 0 8px; }
+.bridgerow { display: flex; align-items: center; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 8px; }
+.bfrom { font: 700 26px var(--mono); color: #ffe9a8; display: grid; text-align: center; }
+.bfrom small { font: 11px system-ui, sans-serif; color: var(--muted); }
+.barrow { font-size: 26px; color: #ffe9a8; }
+.bchips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+.bchip {
+  background: var(--panel-2); border: 1px solid color-mix(in srgb, var(--c, #8a8c92) 60%, #444); border-radius: 8px;
+  padding: 6px 10px; font-size: 13px;
+}
+.bchip:hover { border-color: #ffe9a8; }
+.bchip b { font-family: var(--mono); margin-right: 4px; }
+.bchip small { color: var(--muted); margin-left: 4px; }
